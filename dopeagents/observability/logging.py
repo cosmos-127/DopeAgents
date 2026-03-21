@@ -17,13 +17,11 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import Optional
 
-from rich.logging import RichHandler
 from rich.console import Console
+from rich.logging import RichHandler
 
 from dopeagents.config import get_config, reset_config
-
 
 # ── Module-level logger cache ──────────────────────────────────────
 
@@ -32,14 +30,14 @@ _loggers_cache: dict[str, logging.Logger] = {}
 
 def get_logger(name: str) -> logging.Logger:
     """Get a logger with Rich support, configured from environment.
-    
+
     Args:
         name: Logger name, typically __name__ from calling module.
-        
+
     Returns:
         logging.Logger configured with Rich handler if colors enabled,
         plain StreamHandler otherwise.
-        
+
     Example:
         logger = get_logger(__name__)
         logger.info("Agent started")
@@ -60,6 +58,7 @@ def get_logger(name: str) -> logging.Logger:
         return _loggers_cache.setdefault(name, logger)
 
     # Create appropriate handler based on color config
+    handler: logging.Handler
     if config.log_color:
         # Rich handler with colors for development
         handler = RichHandler(

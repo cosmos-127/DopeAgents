@@ -26,6 +26,13 @@ from dopeagents.config import DopeAgentsConfig, get_config, set_config, reset_co
 # Observability
 from dopeagents.observability.logging import get_logger
 
+# Agents (Phase 1)
+from dopeagents.agents import (
+    DeepSummarizer,
+    DeepSummarizerInput,
+    DeepSummarizerOutput,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -54,5 +61,9 @@ __all__ = [
     "reset_config",
     # Observability
     "get_logger",
+    # Agents (Phase 1)
+    "DeepSummarizer",
+    "DeepSummarizerInput",
+    "DeepSummarizerOutput",
 ]
 

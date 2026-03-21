@@ -1,0 +1,43 @@
+---
+config:
+  theme: dark
+  themeVariables:
+    primaryColor: "#1e1e1e"
+    primaryBorderColor: "#333333"
+    background: "#1e1e1e"
+    mainBkg: "#2d2d2d"
+    secondBkg: "#3d3d3d"
+    textColor: "#e0e0e0"
+    borderColor: "#555555"
+---
+flowchart TD
+    Start([Input: Text, Max Length, Style, Focus]) --> Analyze["Step 1: Analyze<br/>- Analyze text structure<br/>- Recommend chunk size<br/>- Classify text type & complexity"]
+    
+    Analyze --> Chunk["Step 2: Chunk<br/>- Split into semantically coherent chunks<br/>- Respect target chunk size<br/>- Max 10 chunks"]
+    
+    Chunk --> Summarize["Step 3: Summarize<br/>- Summarize each chunk independently<br/>- Generate chunk summaries<br/>- Parallelized for efficiency"]
+    
+    Summarize --> Synthesize["Step 4: Synthesize<br/>- Combine chunk summaries<br/>- Merge & deduplicate information<br/>- Extract 3-5 key points"]
+    
+    Synthesize --> Evaluate["Step 5: Evaluate<br/>- Score quality 0.0-1.0<br/>- Check: faithfulness, completeness, coherence<br/>- Identify unsupported claims<br/>- Track score history"]
+    
+    Evaluate --> Decision{Should Refine?<br/><br/>1. Score ≥ threshold?<br/>2. Rounds ≥ max loops?<br/>3. Plateau detected?<br/><br/>If ANY true → Format}
+    
+    Decision -->|No, continue refining| Refine["Step 6: Refine<br/>- Improve synthesis using feedback<br/>- Ground claims in original text<br/>- Increment refinement rounds"]
+    
+    Decision -->|Yes, stop refining| Format["Step 7: Format<br/>- Apply style: paragraph/bullets/tldr<br/>- Enforce max length<br/>- Calculate word count & truncation"]
+    
+    Refine --> Evaluate
+    
+    Format --> End([Output: Summary, Key Points,<br/>Quality Score, Refinement Rounds,<br/>Chunks Processed, Word Count, Truncated])
+    
+    style Start fill:#2d5016,stroke:#5cb85c,color:#fff
+    style End fill:#2d5016,stroke:#5cb85c,color:#fff
+    style Analyze fill:#3d3d3d,stroke:#ffa500,color:#ffa500
+    style Chunk fill:#3d3d3d,stroke:#ffa500,color:#ffa500
+    style Summarize fill:#3d3d3d,stroke:#ffa500,color:#ffa500
+    style Synthesize fill:#3d3d3d,stroke:#ffa500,color:#ffa500
+    style Evaluate fill:#3d3d3d,stroke:#ff6b6b,color:#ff6b6b
+    style Refine fill:#3d3d3d,stroke:#ff6b6b,color:#ff6b6b
+    style Format fill:#3d3d3d,stroke:#4b8ec4,color:#4b8ec4
+    style Decision fill:#3d3d3d,stroke:#ffd700,color:#ffd700

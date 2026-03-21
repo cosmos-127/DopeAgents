@@ -202,14 +202,14 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 
 ### Definition of Done — Phase 0
 
-- [ ] `python -c "from dopeagents import Agent, AgentContext, AgentResult, ExecutionMetrics, StepMetrics"` succeeds
-- [ ] A minimal concrete `Agent[SomeInput, SomeOutput]` subclass can be defined with `name`, `version`, `description`, `capabilities` and a `run()` implementation
-- [ ] `Agent.input_type()` and `Agent.output_type()` resolve correctly (including two-level subclass hierarchies)
-- [ ] `agent._extract()` is callable and calls Instructor (`instructor.from_litellm`) — confirmed by monkeypatching the client in a test
-- [ ] All errors in `errors.py` are importable and carry their structured fields (including `BudgetDegradedError`)
-- [ ] `DopeAgentsConfig.from_env()` reads `DOPEAGENTS_*` env vars correctly
-- [ ] `mypy --strict dopeagents/core/` exits 0
-- [ ] `pytest tests/` passes (all foundation tests green)
+- [X] `python -c "from dopeagents import Agent, AgentContext, AgentResult, ExecutionMetrics, StepMetrics"` succeeds
+- [X] A minimal concrete `Agent[SomeInput, SomeOutput]` subclass can be defined with `name`, `version`, `description`, `capabilities` and a `run()` implementation
+- [X] `Agent.input_type()` and `Agent.output_type()` resolve correctly (including two-level subclass hierarchies)
+- [X] `agent._extract()` is callable and calls Instructor (`instructor.from_litellm`) — confirmed by monkeypatching the client in a test
+- [X] All errors in `errors.py` are importable and carry their structured fields (including `BudgetDegradedError`)
+- [X] `DopeAgentsConfig.from_env()` reads `DOPEAGENTS_*` env vars correctly
+- [X] `mypy --strict dopeagents/core/` exits 0
+- [X] `pytest tests/` passes (all foundation tests green)
 
 ---
 
@@ -383,15 +383,15 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 
 ### Definition of Done — Phase 1
 
-- [ ] `DeepSummarizer().run(DeepSummarizerInput(text="...", style="bullets"))` returns a valid `DeepSummarizerOutput` with a real LLM
-- [ ] `DeepSummarizer().describe().steps` == `["analyze", "chunk", "summarize", "synthesize", "evaluate", "refine", "format"]`
-- [ ] `DeepSummarizer().describe().has_loops` is `True`
-- [ ] `DeepSummarizer().debug(input)` returns `is_multi_step=True` and populated `step_prompts`
-- [ ] A document with `quality_score < 0.8` on first synthesize triggers at least one `refine` loop
-- [ ] The refine loop respects `max_refinement_loops` (default 3) and terminates
-- [ ] `_step_summarize` respects `max_chunks` guard (default 10)
-- [ ] `mypy --strict dopeagents/agents/deep_summarizer.py` exits 0
-- [ ] All unit tests pass without a real API key (mocked `_extract()`)
+- [X] `DeepSummarizer().run(DeepSummarizerInput(text="...", style="bullets"))` returns a valid `DeepSummarizerOutput` with a real LLM
+- [X] `DeepSummarizer().describe().steps` == `["analyze", "chunk", "summarize", "synthesize", "evaluate", "refine", "format"]`
+- [X] `DeepSummarizer().describe().has_loops` is `True`
+- [X] `DeepSummarizer().debug(input)` returns `is_multi_step=True` and populated `step_prompts`
+- [X] A document with `quality_score < 0.8` on first synthesize triggers at least one `refine` loop
+- [X] The refine loop respects `max_refinement_loops` (default 3) and terminates
+- [X] `_step_summarize` respects `max_chunks` guard (default 10)
+- [X] `mypy --strict dopeagents/agents/deep_summarizer.py` exits 0
+- [X] All unit tests pass without a real API key (mocked `_extract()`)
 
 ---
 

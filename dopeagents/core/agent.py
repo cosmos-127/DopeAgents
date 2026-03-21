@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from typing import (
     TypeVar,
@@ -21,6 +22,13 @@ from dopeagents.core.context import AgentContext
 from dopeagents.core.metadata import AgentMetadata
 from dopeagents.core.types import AgentResult
 from dopeagents.errors import TypeResolutionError, FrameworkNotInstalledError
+
+# Load .env if present (python-dotenv is a declared dependency)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 InputT = TypeVar("InputT", bound=BaseModel)
 OutputT = TypeVar("OutputT", bound=BaseModel)
@@ -65,6 +73,9 @@ class AgentDescription(BaseModel):
     name: str
     version: str
     description: str
+    is_multi_step: bool = Field(
+        default=False, description="Whether this agent has multiple steps"
+    )
     steps: list[str] = Field(
         default_factory=list, description="List of step names in order"
     )
@@ -101,15 +112,35 @@ class Agent(ABC, Generic[InputT, OutputT]):
     system_prompt: ClassVar[str] = ""
     step_prompts: ClassVar[dict[str, str]] = {}
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        step_models: Optional[dict[str, str]] = None,
+        **kwargs: Any
+    ) -> None:
         """Initialize agent instance.
         
-        Subclasses can override __init__ to accept configuration,
-        but must call super().__init__().
+        Args:
+            model: Model to use for all steps (can be overridden by step_models)
+            step_models: Per-step model overrides
         """
         # Note: system_prompt is a ClassVar, so we don't override it at instance level
         # Remove this kwarg if passed to avoid unexpected behavior
         kwargs.pop("system_prompt", None)
+        
+        # Store instance-level model configuration
+        # Prefer groq when key is present, fall back to openai model otherwise
+        import os
+        default_fallback = (
+            "groq/llama-3.1-8b-instant"
+            if os.environ.get("GROQ_API_KEY")
+            else "openai/gpt-4o-mini"
+        )
+        self._model = model or self.default_model or default_fallback
+        self._step_models = step_models or {}
+        
+        # Initialize cached graph (lazy-built by _get_graph)
+        self._graph = None
 
     # ── Type introspection (for accessing InputT and OutputT) ───────
 
@@ -180,12 +211,75 @@ class Agent(ABC, Generic[InputT, OutputT]):
             ExtractionValidationError: Schema validation failed
             ExtractionProviderError: Provider error (rate limit, etc.)
         """
-        # Stub: Return a dummy response for now
-        # Real implementation will use Instructor + LiteLLM
-        # This is filled in by Instructor integration (later phase)
-        raise NotImplementedError(
-            "_extract() is implemented in Phase 1 when Instructor integration is added"
-        )
+        import re
+        import time
+        import instructor
+        import litellm
+        from dopeagents.errors import ExtractionProviderError
+
+        # Determine model: explicit arg > instance default
+        resolved_model = model or self._model
+
+        # Groq requires JSON mode (tool_call mode has array schema issues)
+        if "groq" in resolved_model.lower():
+            mode = instructor.Mode.MD_JSON
+        else:
+            mode = instructor.Mode.TOOLS
+
+        litellm_client = instructor.from_litellm(litellm.completion, mode=mode)
+
+        # Pacing delay for groq free-tier TPM limits (~2 calls/sec)
+        if "groq" in resolved_model.lower():
+            time.sleep(0.5)
+
+        for attempt in range(4):
+            try:
+                result = litellm_client.chat.completions.create(
+                    model=resolved_model,
+                    response_model=response_model,
+                    messages=messages,
+                    **kwargs,
+                )
+                return cast(BaseModel, result)
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                if "rate_limit" not in exc_str and "429" not in exc_str:
+                    raise
+
+                # Parse retry-after from error message (e.g. "try again in 5m51s")
+                retry_after: Optional[int] = None
+                m = re.search(r"try again in (\d+)m([\d.]+)s", str(exc))
+                if m:
+                    retry_after = int(m.group(1)) * 60 + int(float(m.group(2)))
+
+                # TPD (tokens per day) limit requires a very long wait — fail fast
+                # rather than hanging; let the caller surface a clean error.
+                if retry_after is not None and retry_after > 60:
+                    provider = "groq" if "groq" in resolved_model.lower() else "unknown"
+                    raise ExtractionProviderError(
+                        message=(
+                            f"Daily token quota reached for {provider}. "
+                            f"Retry after {retry_after // 60}m{retry_after % 60}s."
+                        ),
+                        provider=provider,
+                        status_code=429,
+                        retry_after=retry_after,
+                    ) from exc
+
+                # Short TPM rate limit — exponential backoff (max 3 retries)
+                if attempt < 3:
+                    wait = 2 ** attempt  # 1, 2, 4 seconds
+                    time.sleep(wait)
+                    continue
+
+                provider = "groq" if "groq" in resolved_model.lower() else "unknown"
+                raise ExtractionProviderError(
+                    message=f"Rate limit exceeded after {attempt + 1} attempts.",
+                    provider=provider,
+                    status_code=429,
+                    retry_after=retry_after,
+                ) from exc
+        raise RuntimeError("_extract: exhausted retries")  # unreachable
 
     def _extract_partial(
         self,
@@ -229,11 +323,13 @@ class Agent(ABC, Generic[InputT, OutputT]):
         Used for discovery, composition validation, and MCP schema generation.
         Does NOT execute the agent.
         """
+        steps = list(self.step_prompts.keys())
         return AgentDescription(
             name=self.name,
             version=self.version,
             description=self.description,
-            steps=list(self.step_prompts.keys()),
+            is_multi_step=bool(steps),
+            steps=steps,
             has_loops=self._has_loops(),
             capabilities=self.capabilities,
             tags=self.tags,
@@ -413,4 +509,29 @@ class Agent(ABC, Generic[InputT, OutputT]):
         Single-step agents return None.
         """
         return None
+
+    def _get_graph(self) -> Any:
+        """Lazily build and cache the internal LangGraph.
+        
+        Multi-step agents implement _build_graph() to return a compiled graph.
+        Single-step agents don't override this — _get_graph() returns None.
+        
+        The compiled graph is a private implementation detail — callers use run().
+        """
+        if self._graph is None and hasattr(self, "_build_graph"):
+            self._graph = self._build_graph()
+        return self._graph
+
+    def _model_for_step(self, step_name: str) -> str:
+        """Returns the model to use for a given step.
+        
+        Respects step-level overrides via _step_models, falling back to _model.
+        
+        Args:
+            step_name: Name of the step (e.g., "analyze", "summarize")
+        
+        Returns:
+            Model name to use for this step
+        """
+        return self._step_models.get(step_name, self._model)
 
