@@ -1,15 +1,12 @@
 """Tests for error handling."""
 
-import pytest
-from pydantic import BaseModel
 from dopeagents.errors import (
-    DopeAgentsError,
-    ExtractionError,
-    ExtractionValidationError,
-    ExtractionProviderError,
-    CostError,
-    BudgetExceededError,
     BudgetDegradedError,
+    BudgetExceededError,
+    CostError,
+    DopeAgentsError,
+    ExtractionProviderError,
+    ExtractionValidationError,
     TypeResolutionError,
 )
 
@@ -36,12 +33,10 @@ class TestErrorStructure:
             message="Schema validation failed",
             step_name="analyze",
             response_model="AnalyzeOutput",
-            validation_errors=[
-                {"loc": ("summary",), "msg": "field required"}
-            ],
+            validation_errors=[{"loc": ("summary",), "msg": "field required"}],
         )
         assert error.step_name == "analyze"
-        assert len(error.validation_errors) > 0
+        assert error.validation_errors is not None and len(error.validation_errors) > 0
 
     def test_extraction_provider_error(self) -> None:
         """Provider error carries status code and retry info."""
@@ -102,7 +97,7 @@ class TestErrorStructure:
         )
         assert isinstance(error, DopeAgentsError)
         assert isinstance(error, CostError)
-        assert isinstance(error, BaseModel)
+        assert isinstance(error, Exception)
 
     def test_all_errors_are_pydantic_models(self) -> None:
         """All errors are Pydantic models for serialization."""
@@ -114,4 +109,3 @@ class TestErrorStructure:
         # Should be serializable to JSON
         json_str = error.model_dump_json()
         assert "extraction_validation_error" in json_str
-

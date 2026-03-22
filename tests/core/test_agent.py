@@ -1,16 +1,14 @@
 """Tests for Agent base class."""
 
-import pytest
-from typing import ClassVar
-from pydantic import BaseModel, Field
-from uuid import UUID
 from datetime import datetime
+from typing import Any, ClassVar
+from uuid import UUID
 
-from dopeagents.core.agent import Agent, DebugInfo, AgentDescription
+from pydantic import BaseModel, Field
+
+from dopeagents.core.agent import Agent, DebugInfo
 from dopeagents.core.context import AgentContext
 from dopeagents.core.types import AgentResult
-from dopeagents.errors import TypeResolutionError, FrameworkNotInstalledError
-
 
 # ── Test Fixtures ─────────────────────────────────────────────────────
 
@@ -42,7 +40,6 @@ class SimpleAgentImplementation(Agent[SimpleInputModel, SimpleOutputModel]):
         context: AgentContext | None = None,
     ) -> AgentResult[SimpleOutputModel]:
         """Dummy implementation."""
-        ctx = context or AgentContext()
         return AgentResult(
             output=SimpleOutputModel(result=f"Processed: {input_data.text}"),
             success=True,
@@ -80,7 +77,6 @@ class MultiStepAgentImplementation(Agent[MultiStepInputModel, MultiStepOutputMod
         context: AgentContext | None = None,
     ) -> AgentResult[MultiStepOutputModel]:
         """Dummy multi-step implementation."""
-        ctx = context or AgentContext()
         return AgentResult(
             output=MultiStepOutputModel(summary="Summary", score=0.9),
             success=True,
@@ -106,30 +102,34 @@ class TestTypeResolution:
 
     def test_type_resolution_with_inheritance(self) -> None:
         """Type resolution works for two-level inheritance."""
+
         # Create a subclass of SimpleAgentImplementation
         class DerivedAgent(SimpleAgentImplementation):
             pass
 
         input_type = DerivedAgent.input_type()
         output_type = DerivedAgent.output_type()
-        
+
         assert input_type is SimpleInputModel
         assert output_type is SimpleOutputModel
 
     def test_type_mismatch_raises_error(self) -> None:
         """Missing type params raises error during type resolution."""
+
         # Create agent without type params
-        class BadAgent(Agent):
+        class BadAgent(Agent):  # type: ignore[type-arg]
             name: ClassVar[str] = "BadAgent"
 
-            def run(self, input_data: BaseModel, context: AgentContext | None = None):
+            def run(self, input_data: BaseModel, context: AgentContext | None = None) -> Any:
                 pass
 
         # Attempting to resolve types should raise an error
         try:
             BadAgent.input_type()
             # If we get here without error, the agent doesn't define proper type params
-            assert False, "Expected error when resolving types for agent without type params"
+            raise AssertionError(
+                "Expected error when resolving types for agent without type params"
+            )
         except (TypeError, ValueError, AttributeError):
             # Expected error when type resolution fails
             pass
@@ -142,7 +142,7 @@ class TestAgentContext:
         """AgentContext auto-generates run_id."""
         ctx1 = AgentContext()
         ctx2 = AgentContext()
-        
+
         assert isinstance(ctx1.run_id, UUID)
         assert isinstance(ctx2.run_id, UUID)
         assert ctx1.run_id != ctx2.run_id
@@ -173,7 +173,7 @@ class TestAgentMetadata:
         """describe() returns AgentDescription."""
         agent = SimpleAgentImplementation()
         desc = agent.describe()
-        
+
         assert desc.name == "SimpleAgentImplementation"
         assert desc.version == "0.1.0"
         assert desc.description == "A test agent"
@@ -184,7 +184,7 @@ class TestAgentMetadata:
         """describe() includes step names for multi-step agents."""
         agent = MultiStepAgentImplementation()
         desc = agent.describe()
-        
+
         assert desc.steps == ["analyze", "evaluate", "refine"]
         assert desc.has_loops is True
 
@@ -192,7 +192,7 @@ class TestAgentMetadata:
         """describe() includes input/output schemas."""
         agent = SimpleAgentImplementation()
         desc = agent.describe()
-        
+
         assert "properties" in desc.input_schema
         assert "properties" in desc.output_schema
 
@@ -201,7 +201,7 @@ class TestAgentMetadata:
         agent = SimpleAgentImplementation()
         input_data = SimpleInputModel(text="test")
         debug = agent.debug(input_data)
-        
+
         assert isinstance(debug, DebugInfo)
         assert debug.system_prompt == ""
         assert "properties" in debug.input_schema
@@ -212,7 +212,7 @@ class TestAgentMetadata:
         agent = MultiStepAgentImplementation()
         input_data = MultiStepInputModel(text="test")
         debug = agent.debug(input_data)
-        
+
         assert debug.step_prompts == {
             "analyze": "Analyze the text",
             "evaluate": "Evaluate quality",
@@ -223,7 +223,7 @@ class TestAgentMetadata:
         """metadata() returns AgentMetadata model."""
         agent = SimpleAgentImplementation()
         meta = agent.metadata()
-        
+
         assert meta.name == "SimpleAgentImplementation"
         assert meta.version == "0.1.0"
         assert meta.requires_llm is True
@@ -236,17 +236,17 @@ class TestFrameworkAdapters:
         """as_callable() wraps agent as plain Python callable."""
         agent = SimpleAgentImplementation()
         fn = agent.as_callable()
-        
+
         input_data = SimpleInputModel(text="hello")
         output = fn(input_data)
-        
+
         assert output.result == "Processed: hello"
 
     def test_as_openai_function(self) -> None:
         """as_openai_function() returns OpenAI-compatible dict."""
         agent = SimpleAgentImplementation()
         func_def = agent.as_openai_function()
-        
+
         assert func_def["name"] == "simpleagentimplementation"
         assert func_def["description"]
         assert "parameters" in func_def
@@ -254,7 +254,7 @@ class TestFrameworkAdapters:
     def test_mcp_adapter_import_error(self) -> None:
         """as_mcp_tool() returns tool definition or raises helpful error."""
         agent = SimpleAgentImplementation()
-        
+
         # Try to call the adapter - it should return a tool definition or raise error
         try:
             result = agent.as_mcp_tool()
@@ -268,7 +268,7 @@ class TestFrameworkAdapters:
     def test_langchain_adapter_import_error(self) -> None:
         """as_langchain_runnable() returns runnable or raises helpful error."""
         agent = SimpleAgentImplementation()
-        
+
         # Try to call the adapter - it should return a runnable or raise error
         try:
             result = agent.as_langchain_runnable()
@@ -287,9 +287,9 @@ class TestAgentExecution:
         """run() returns AgentResult[OutputT]."""
         agent = SimpleAgentImplementation()
         input_data = SimpleInputModel(text="test input")
-        
+
         result = agent.run(input_data)
-        
+
         assert isinstance(result, AgentResult)
         assert result.success is True
         assert result.output is not None
@@ -300,18 +300,18 @@ class TestAgentExecution:
         agent = SimpleAgentImplementation()
         input_data = SimpleInputModel(text="test")
         ctx = AgentContext(metadata={"user": "test"})
-        
+
         result = agent.run(input_data, context=ctx)
-        
+
         assert result.success is True
 
     def test_multistep_agent_execution(self) -> None:
         """Multi-step agents execute successfully."""
         agent = MultiStepAgentImplementation()
         input_data = MultiStepInputModel(text="test")
-        
+
         result = agent.run(input_data)
-        
+
         assert result.success is True
         assert result.output is not None
         assert result.output.score == 0.9
@@ -324,7 +324,7 @@ class TestTypeObjects:
         """Returned schemas are valid Pydantic JSON schemas."""
         input_type = SimpleAgentImplementation.input_type()
         schema = input_type.model_json_schema()
-        
+
         assert "properties" in schema
         assert "type" in schema
 
@@ -332,10 +332,9 @@ class TestTypeObjects:
         """Types resolved from agents can be instantiated."""
         InputType = SimpleAgentImplementation.input_type()
         OutputType = SimpleAgentImplementation.output_type()
-        
+
         input_instance = InputType(text="test")
         output_instance = OutputType(result="result")
-        
+
         assert input_instance.text == "test"
         assert output_instance.result == "result"
-

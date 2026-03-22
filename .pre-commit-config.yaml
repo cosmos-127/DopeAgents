@@ -1,0 +1,31 @@
+repos:
+  # Import sorting with isort (must run first to avoid conflicts with ruff)
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: [--profile=black, --line-length=100]
+
+  # Code formatting with ruff
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.3.5
+    hooks:
+      - id: ruff-format
+      - id: ruff
+        args: [--fix]
+
+  # Type checking with mypy
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.8.0
+    hooks:
+      - id: mypy
+        args: [--config-file=pyproject.toml, --no-incremental, --explicit-package-bases, --warn-unused-ignores]
+        files: ^(dopeagents|tests|scripts)/
+        additional_dependencies:
+          - pydantic
+          - pydantic-settings
+          - instructor
+          - litellm
+          - langgraph
+          - typing-extensions
+          - pytest

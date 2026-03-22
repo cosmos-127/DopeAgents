@@ -1,29 +1,72 @@
-"""DopeAgents error hierarchy — typed, structured errors with metadata."""
+"""DopeAgents error hierarchy — typed, structured Python exceptions with metadata.
 
-from typing import Any, Optional
-from pydantic import BaseModel, Field
+All errors are real Python exceptions (inherit from Exception) so they can be
+raised and caught with standard try/except semantics.  Structured fields are
+stored as instance attributes; ``model_dump_json()`` provides JSON serialization
+that mirrors the Pydantic BaseModel interface for compatibility.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
 
 
-class DopeAgentsError(BaseModel):
+class DopeAgentsError(Exception):
     """Base error for all DopeAgents exceptions.
-    
-    All errors carry structured metadata rather than bare string messages.
-    Inherits from BaseModel for structured validation but acts like an Exception.
+
+    Structured fields are stored as instance attributes; call
+    ``model_dump_json()`` for JSON serialization (mirrors the Pydantic
+    BaseModel interface so existing inspection code is compatible).
     """
 
-    error_type: str
-    message: str
-    agent_name: Optional[str] = None
-    original_error: Optional[str] = None
+    # Class-level default for the error type discriminator
+    error_type: str = "dopeagents_error"
 
-    class Config:
-        """Pydantic config."""
-
-        arbitrary_types_allowed = True
+    def __init__(
+        self,
+        message: str = "",
+        error_type: str | None = None,
+        agent_name: str | None = None,
+        original_error: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.error_type = error_type if error_type is not None else type(self).error_type
+        self.agent_name = agent_name
+        self.original_error = original_error
+        # Absorb any extra keyword arguments as attributes (supports subclasses
+        # forwarding their own fields transparently via **kwargs)
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
     def __str__(self) -> str:
-        """Return the error message for logging/display."""
         return self.message
+
+    def model_dump_json(self, **_: Any) -> str:
+        """Return a JSON string of this error's structured fields.
+
+        Mirrors the Pydantic BaseModel.model_dump_json() interface so code
+        that serialises errors doesn't need to know which base class is used.
+        """
+        data: dict[str, Any] = {}
+        # Collect annotated field names from the whole MRO so all subclass
+        # fields are included in order (reversed = base → most-derived, so
+        # more-derived annotations overwrite duplicates from base)
+        for cls in reversed(type(self).__mro__):
+            for k in getattr(cls, "__annotations__", {}):
+                if not k.startswith("_"):
+                    data[k] = getattr(self, k, None)
+        # Always include the core fields
+        data["error_type"] = self.error_type
+        data["message"] = self.message
+        return json.dumps(data, default=str)
+
+    def model_dump(self) -> dict[str, Any]:
+        """Return a dict of this error's structured fields."""
+        result = json.loads(self.model_dump_json())
+        return result  # type: ignore[no-any-return]
 
 
 # ── Extraction Layer Errors ──────────────────────────────────────────────
@@ -33,29 +76,40 @@ class ExtractionError(DopeAgentsError):
     """Base for all extraction layer errors."""
 
     error_type: str = "extraction_error"
-    step_name: Optional[str] = None
-    input_data: Optional[str] = None
+    step_name: str | None = None
+    input_data: str | None = None
 
 
 class ExtractionValidationError(ExtractionError):
     """Structured extraction failed validation (Pydantic schema mismatch).
-    
+
     Occurs when Instructor's auto-retry cannot recover — output
     repeatedly fails Pydantic schema validation.
     """
 
     error_type: str = "extraction_validation_error"
-    response_model: Optional[str] = None
-    validation_errors: list[dict[str, Any]] = Field(default_factory=list)
+    response_model: str | None = None
+    validation_errors: list[dict[str, Any]] | None = None
+
+    def __init__(
+        self,
+        message: str = "",
+        response_model: str | None = None,
+        validation_errors: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message=message, **kwargs)
+        self.response_model = response_model
+        self.validation_errors = validation_errors or []
 
 
 class ExtractionProviderError(ExtractionError):
     """Provider-level error (rate limit, auth, service down, etc.)."""
 
     error_type: str = "extraction_provider_error"
-    provider: Optional[str] = None
-    status_code: Optional[int] = None
-    retry_after: Optional[int] = None  # seconds, if applicable
+    provider: str | None = None
+    status_code: int | None = None
+    retry_after: int | None = None  # seconds, if applicable
 
 
 # ── Cost & Budget Errors ──────────────────────────────────────────────
@@ -71,31 +125,25 @@ class CostError(DopeAgentsError):
 
 class BudgetExceededError(CostError):
     """Budget limit exceeded — execution halted.
-    
+
     Raised when cost exceeds `max_cost_per_call`, `max_cost_per_step`,
     `max_cost_per_agent`, or `max_cost_global` with `on_exceeded="error"`.
     """
 
     error_type: str = "budget_exceeded_error"
-    budget_type: str = Field(
-        default="per_call",
-        description="Type of budget exceeded: per_call, per_step, per_agent, or global",
-    )
+    budget_type: str = "per_call"
 
 
 class BudgetDegradedError(CostError):
     """Budget exhausted — returned best-so-far result with degradation.
-    
+
     Raised when cost exceeds budget with `on_exceeded="degrade"`.
     The degraded_output contains the best result produced before budget exhaustion.
     """
 
     error_type: str = "budget_degraded_error"
-    degraded_output: Optional[Any] = None
-    budget_type: str = Field(
-        default="per_call",
-        description="Type of budget that triggered degradation",
-    )
+    degraded_output: Any | None = None
+    budget_type: str = "per_call"
 
 
 class TokenCountError(CostError):
@@ -111,7 +159,7 @@ class OrchestrationError(DopeAgentsError):
     """Base for graph orchestration errors."""
 
     error_type: str = "orchestration_error"
-    graph_state: Optional[dict[str, Any]] = None
+    graph_state: dict[str, Any] | None = None
 
 
 class GraphConstructionError(OrchestrationError):
@@ -124,8 +172,8 @@ class GraphExecutionError(OrchestrationError):
     """Graph execution failed (step method raised exception, etc.)."""
 
     error_type: str = "graph_execution_error"
-    step_name: Optional[str] = None
-    step_state: Optional[dict[str, Any]] = None
+    step_name: str | None = None
+    step_state: dict[str, Any] | None = None
 
 
 # ── Contract & Composition Errors ──────────────────────────────────────
@@ -135,8 +183,8 @@ class ContractError(DopeAgentsError):
     """Base for agent contract and composition errors."""
 
     error_type: str = "contract_error"
-    agent_a: Optional[str] = None
-    agent_b: Optional[str] = None
+    agent_a: str | None = None
+    agent_b: str | None = None
 
 
 class IncompatibleAgentsError(ContractError):
@@ -150,8 +198,19 @@ class PipelineValidationError(ContractError):
     """Multi-agent pipeline validation failed."""
 
     error_type: str = "pipeline_validation_error"
-    agents: list[str] = Field(default_factory=list)
-    failing_connection: Optional[tuple[str, str]] = None
+    agents: list[str] | None = None
+    failing_connection: tuple[str, str] | None = None
+
+    def __init__(
+        self,
+        message: str = "",
+        agents: list[str] | None = None,
+        failing_connection: tuple[str, str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message=message, **kwargs)
+        self.agents = agents or []
+        self.failing_connection = failing_connection
 
 
 # ── Type & Introspection Errors ──────────────────────────────────────
@@ -161,16 +220,14 @@ class TypeResolutionError(DopeAgentsError):
     """Failed to resolve InputT or OutputT from Agent subclass."""
 
     error_type: str = "type_resolution_error"
-    resolution_type: str = Field(
-        default="unknown", description="What failed to resolve: input_type or output_type"
-    )
+    resolution_type: str = "unknown"
 
 
 class SchemaExtractionError(DopeAgentsError):
     """Failed to extract Pydantic schema from agent type."""
 
     error_type: str = "schema_extraction_error"
-    field_name: Optional[str] = None
+    field_name: str | None = None
 
 
 # ── Configuration Errors ──────────────────────────────────────────────
@@ -186,14 +243,23 @@ class ConfigNotFoundError(ConfigError):
     """Configuration file or environment not found."""
 
     error_type: str = "config_not_found_error"
-    config_source: Optional[str] = None
+    config_source: str | None = None
 
 
 class ConfigValidationError(ConfigError):
     """Configuration validation failed."""
 
     error_type: str = "config_validation_error"
-    valid_keys: list[str] = Field(default_factory=list)
+    valid_keys: list[str] | None = None
+
+    def __init__(
+        self,
+        message: str = "",
+        valid_keys: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message=message, **kwargs)
+        self.valid_keys = valid_keys or []
 
 
 # ── Framework Adapter Errors ──────────────────────────────────────────
@@ -203,7 +269,7 @@ class AdapterError(DopeAgentsError):
     """Base for framework adapter errors."""
 
     error_type: str = "adapter_error"
-    framework: Optional[str] = None
+    framework: str | None = None
 
 
 class FrameworkNotInstalledError(AdapterError):
@@ -216,7 +282,7 @@ class AdapterUnsupportedError(AdapterError):
     """Agent does not support this adapter."""
 
     error_type: str = "adapter_unsupported_error"
-    adapter_name: Optional[str] = None
+    adapter_name: str | None = None
 
 
 # ── MCP & Protocol Errors ────────────────────────────────────────────
@@ -232,7 +298,7 @@ class ToolRegistrationError(MCPError):
     """Failed to register agent as MCP tool."""
 
     error_type: str = "tool_registration_error"
-    tool_name: Optional[str] = None
+    tool_name: str | None = None
 
 
 # ── Sandbox & Execution Errors ──────────────────────────────────────
@@ -255,9 +321,7 @@ class SandboxResourceError(SandboxError):
     """Sandbox execution exceeded resource limits."""
 
     error_type: str = "sandbox_resource_error"
-    resource_type: str = Field(
-        default="memory", description="Type of resource exceeded: memory, cpu, etc."
-    )
+    resource_type: str = "memory"
     limit: float = 0.0
     usage: float = 0.0
 
@@ -276,14 +340,23 @@ class MaxRetriesExceededError(ResilienceError):
 
     error_type: str = "max_retries_exceeded_error"
     retry_count: int = 0
-    last_error: Optional[str] = None
+    last_error: str | None = None
 
 
 class DegradationError(DopeAgentsError):
     """Entire agent degradation chain failed."""
 
     error_type: str = "degradation_error"
-    fallback_agents: list[str] = Field(default_factory=list)
+    fallback_agents: list[str] | None = None
+
+    def __init__(
+        self,
+        message: str = "",
+        fallback_agents: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message=message, **kwargs)
+        self.fallback_agents = fallback_agents or []
 
 
 # ── Cache Errors ────────────────────────────────────────────────────
@@ -305,7 +378,68 @@ class CacheStoreError(CacheError):
     """Cache write/read operation failed."""
 
     error_type: str = "cache_store_error"
-    operation: str = Field(default="unknown", description="Operation: read, write, or delete")
+    operation: str = "unknown"
+
+
+# ── Execution Errors (used by AgentExecutor) ─────────────────────────
+
+
+class AgentExecutionError(DopeAgentsError):
+    """Agent execution failed — wraps the underlying exception."""
+
+    error_type: str = "agent_execution_error"
+    agent_version: str | None = None
+
+
+class AllFallbacksFailedError(DopeAgentsError):
+    """Every agent in a FallbackChain / DegradationChain raised an exception."""
+
+    error_type: str = "all_fallbacks_failed_error"
+    chain_agents: list[str] | None = None
+    errors: list[str] | None = None
+
+    def __init__(
+        self,
+        message: str = "",
+        chain_agents: list[str] | None = None,
+        errors: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message=message, **kwargs)
+        self.chain_agents = chain_agents or []
+        self.errors = errors or []
+
+
+class InputValidationError(DopeAgentsError):
+    """Agent input failed Pydantic schema validation."""
+
+    error_type: str = "input_validation_error"
+    validation_errors: list[dict[str, Any]] | None = None
+
+    def __init__(
+        self,
+        message: str = "",
+        validation_errors: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message=message, **kwargs)
+        self.validation_errors = validation_errors or []
+
+
+class OutputValidationError(DopeAgentsError):
+    """Agent output failed Pydantic schema validation."""
+
+    error_type: str = "output_validation_error"
+    validation_errors: list[dict[str, Any]] | None = None
+
+    def __init__(
+        self,
+        message: str = "",
+        validation_errors: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message=message, **kwargs)
+        self.validation_errors = validation_errors or []
 
 
 # ── Registry & Discovery Errors ──────────────────────────────────────
@@ -322,7 +456,18 @@ class AgentNotFoundError(RegistryError):
 
     error_type: str = "agent_not_found_error"
     agent_name: str = ""
-    available_agents: list[str] = Field(default_factory=list)
+    available_agents: list[str] | None = None
+
+    def __init__(
+        self,
+        message: str = "",
+        agent_name: str = "",
+        available_agents: list[str] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(message=message, **kwargs)
+        self.agent_name = agent_name
+        self.available_agents = available_agents or []
 
 
 class RegistryConflictError(RegistryError):
@@ -345,7 +490,7 @@ class MetricComputationError(BenchmarkError):
     """Failed to compute evaluation metric."""
 
     error_type: str = "metric_computation_error"
-    metric_name: Optional[str] = None
+    metric_name: str | None = None
 
 
 # ── Security & PII Errors ──────────────────────────────────────────
@@ -367,4 +512,4 @@ class PIIRedactionError(SecurityError):
     """PII redaction failed — data may be unsafe."""
 
     error_type: str = "pii_redaction_error"
-    field_name: Optional[str] = None
+    field_name: str | None = None

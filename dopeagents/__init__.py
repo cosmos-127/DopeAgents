@@ -3,67 +3,55 @@
 __version__ = "0.1.0"
 
 # Core type system and agent interface
-from dopeagents.core.agent import Agent, DebugInfo, AgentDescription
+# Agents (Phase 1)
+from dopeagents.agents import DeepSummarizer, DeepSummarizerInput, DeepSummarizerOutput
+
+# Configuration
+from dopeagents.config import DopeAgentsConfig, get_config, reset_config, set_config
+from dopeagents.core.agent import Agent, AgentDescription, DebugInfo
 from dopeagents.core.context import AgentContext
 from dopeagents.core.metadata import AgentMetadata
 from dopeagents.core.types import AgentResult, ExecutionMetrics, StepMetrics
 
 # Error hierarchy
 from dopeagents.errors import (
+    BudgetDegradedError,
+    BudgetExceededError,
+    ContractError,
+    CostError,
     DopeAgentsError,
     ExtractionError,
-    ExtractionValidationError,
     ExtractionProviderError,
-    CostError,
-    BudgetExceededError,
-    BudgetDegradedError,
-    ContractError,
+    ExtractionValidationError,
 )
-
-# Configuration
-from dopeagents.config import DopeAgentsConfig, get_config, set_config, reset_config
 
 # Observability
 from dopeagents.observability.logging import get_logger
 
-# Agents (Phase 1)
-from dopeagents.agents import (
-    DeepSummarizer,
-    DeepSummarizerInput,
-    DeepSummarizerOutput,
-)
-
 __all__ = [
-    # Version
-    "__version__",
-    # Core
     "Agent",
     "AgentContext",
+    "AgentDescription",
     "AgentMetadata",
     "AgentResult",
-    "ExecutionMetrics",
-    "StepMetrics",
-    "DebugInfo",
-    "AgentDescription",
-    # Errors
-    "DopeAgentsError",
-    "ExtractionError",
-    "ExtractionValidationError",
-    "ExtractionProviderError",
-    "CostError",
-    "BudgetExceededError",
     "BudgetDegradedError",
+    "BudgetExceededError",
     "ContractError",
-    # Configuration
-    "DopeAgentsConfig",
-    "get_config",
-    "set_config",
-    "reset_config",
-    # Observability
-    "get_logger",
-    # Agents (Phase 1)
+    "CostError",
+    "DebugInfo",
     "DeepSummarizer",
     "DeepSummarizerInput",
     "DeepSummarizerOutput",
+    "DopeAgentsConfig",
+    "DopeAgentsError",
+    "ExecutionMetrics",
+    "ExtractionError",
+    "ExtractionProviderError",
+    "ExtractionValidationError",
+    "StepMetrics",
+    "__version__",
+    "get_config",
+    "get_logger",
+    "reset_config",
+    "set_config",
 ]
-

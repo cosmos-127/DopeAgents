@@ -2,34 +2,55 @@
 
 from __future__ import annotations
 
-from pydantic_settings import BaseSettings
-from typing import Optional, Any
 import threading
+
+from pydantic import Field
+from pydantic_settings import BaseSettings
 
 
 class DopeAgentsConfig(BaseSettings):
     """Global configuration for DopeAgents via environment variables.
-    
+
     Reads from DOPEAGENTS_* environment variables and optional TOML file.
-    
+
     Usage:
         config = DopeAgentsConfig.from_env()
         DEFAULT_MODEL = config.default_model
-        
+
     Or using the global singleton:
         config = get_config()
         set_config(custom_config)
     """
 
-    # ── Model & API defaults ──────────────────────────────────────
+    # ── Provider model defaults ──────────────────────────────────
+    # These live in config (not .env) — they're defaults, not secrets.
+    # Override any of them via DOPEAGENTS_<FIELD> env var if needed.
 
-    default_model: str = "gpt-4o"
-    """Default LLM model for agents."""
+    groq_default_model: str = "groq/llama-3.3-70b-versatile"
+    """Default model for Groq provider."""
 
-    api_key: Optional[str] = None
-    """LLM API key (usually read from OPENAI_API_KEY env var instead)."""
+    openrouter_default_model: str = "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+    """Default model for OpenRouter provider."""
 
-    api_base: Optional[str] = None
+    together_default_model: str = "together_ai/meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    """Default model for Together AI provider."""
+
+    # ── Provider API keys (read from bare env vars, not DOPEAGENTS_ prefixed) ──
+    # Just uncomment the matching key in .env — config auto-detects provider.
+
+    groq_api_key: str | None = Field(default=None, alias="GROQ_API_KEY")
+    openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
+    together_api_key: str | None = Field(default=None, alias="TOGETHER_API_KEY")
+
+    # ── Active model & API ────────────────────────────────────────
+
+    default_model: str | None = None
+    """Explicit model override. If None, auto-detected from active API key."""
+
+    api_key: str | None = None
+    """LLM API key (usually read from provider-specific env var instead)."""
+
+    api_base: str | None = None
     """Optional custom API base URL for provider routing."""
 
     # ── Cost management ───────────────────────────────────────────
@@ -37,13 +58,13 @@ class DopeAgentsConfig(BaseSettings):
     enable_cost_tracking: bool = True
     """Whether to track step-level costs."""
 
-    max_cost_per_call: Optional[float] = None
+    max_cost_per_call: float | None = None
     """Max cost in USD per agent.run() call."""
 
-    max_cost_per_step: Optional[float] = None
+    max_cost_per_step: float | None = None
     """Max cost in USD per individual step."""
 
-    max_cost_global: Optional[float] = None
+    max_cost_global: float | None = None
     """Max total cost in USD across all agents in this session."""
 
     default_cost_exceeded_action: str = "error"
@@ -57,7 +78,7 @@ class DopeAgentsConfig(BaseSettings):
     tracer_type: str = "console"
     """Which tracer to use: 'console', 'otel', or 'noop'."""
 
-    otel_endpoint: Optional[str] = None
+    otel_endpoint: str | None = None
     """OpenTelemetry collector endpoint (if tracer_type='otel')."""
 
     log_prompts: bool = False
@@ -88,7 +109,7 @@ class DopeAgentsConfig(BaseSettings):
     cache_backend: str = "memory"
     """Cache implementation: 'memory' or 'disk'."""
 
-    cache_dir: Optional[str] = None
+    cache_dir: str | None = None
     """Directory for disk cache (if cache_backend='disk')."""
 
     # ── Security ──────────────────────────────────────────────────
@@ -121,25 +142,44 @@ class DopeAgentsConfig(BaseSettings):
         env_prefix = "DOPEAGENTS_"
         env_file = ".env"
         case_sensitive = False
+        extra = "ignore"
+        populate_by_name = True
 
     @classmethod
     def from_env(cls) -> DopeAgentsConfig:
-        """Load configuration from environment variables.
-        
-        Reads DOPEAGENTS_* environment variables and optional .env file.
-        """
+        """Load configuration from environment variables."""
         return cls()
+
+    def resolve_model(self) -> str:
+        """Return the active model, auto-detecting from whichever API key is set.
+
+        Priority:
+          1. DOPEAGENTS_DEFAULT_MODEL (explicit override in .env)
+          2. GROQ_API_KEY present  → groq_default_model
+          3. OPENROUTER_API_KEY present → openrouter_default_model
+          4. TOGETHER_API_KEY present  → together_default_model
+          5. groq_default_model (hardcoded fallback)
+        """
+        if self.default_model:
+            return self.default_model
+        if self.groq_api_key:
+            return self.groq_default_model
+        if self.openrouter_api_key:
+            return self.openrouter_default_model
+        if self.together_api_key:
+            return self.together_default_model
+        return self.groq_default_model
 
 
 # ── Global singleton management ────────────────────────────────────
 
 _config_lock = threading.Lock()
-_default_config: Optional[DopeAgentsConfig] = None
+_default_config: DopeAgentsConfig | None = None
 
 
 def get_config() -> DopeAgentsConfig:
     """Get the global DopeAgents configuration.
-    
+
     Thread-safe. Returns cached singleton or creates new one.
     """
     global _default_config
@@ -154,7 +194,7 @@ def get_config() -> DopeAgentsConfig:
 
 def set_config(config: DopeAgentsConfig) -> None:
     """Set the global DopeAgents configuration.
-    
+
     Thread-safe. All subsequent get_config() calls return this config.
     """
     global _default_config
@@ -165,11 +205,10 @@ def set_config(config: DopeAgentsConfig) -> None:
 
 def reset_config() -> None:
     """Reset configuration to defaults.
-    
+
     Used in testing to start fresh.
     """
     global _default_config
 
     with _config_lock:
         _default_config = None
-

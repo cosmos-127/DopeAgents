@@ -5,13 +5,13 @@
 > **Purpose**: Authoritative **design specification** for all architecture, interfaces, conventions, and implementation targets. Every line of code written traces back to a section in this document.
 
 > [!IMPORTANT]
-> **Document Status — Design Specification, Not Implementation Record**
+> **Document Status — Design Specification + Implementation Record**
 >
-> This document describes the **target architecture** for DopeAgents v0.1.0. It is a normative design spec — code that gets written must conform to what is described here.
+> This document describes both the **target architecture** for DopeAgents v0.1.0 and the current implementation state. It is a normative design spec **and** an accurate record of what is built.
 >
-> As of the current repository state, the codebase contains **scaffold stubs** (module files with placeholder comments). No subsystem is production-complete yet. The [Development Roadmap (§22)](#22-development-roadmap) defines the phased implementation plan.
+> As of the current repository state, Phase 1 core infrastructure is complete. The [Development Roadmap (§22)](#22-development-roadmap) tracks what is implemented (`●`), scaffolded (`◐`), or not yet started (`○`).
 >
-> Code examples in this document are **reference implementations** — they show exactly what should be built, not what exists today. Do not assume a working runtime from reading this document alone.
+> For implemented modules, code examples reflect the actual working implementation. For stub modules, code examples show the target reference implementation that should be built.
 
 ---
 
@@ -292,6 +292,12 @@ OutputT = TypeVar("OutputT", bound=BaseModel)
 
 
 class Agent(ABC, Generic[InputT, OutputT]):
+    """Base class for all DopeAgents.
+    
+    The run() method is @abstractmethod — every concrete agent must implement it.
+    Framework adapters and the lifecycle layer (AgentExecutor) use run(input) → AgentResult
+    as the canonical interface, regardless of which framework calls the agent.
+    """
     """
     Base class for all DopeAgents agents.
 
@@ -330,16 +336,24 @@ class Agent(ABC, Generic[InputT, OutputT]):
     def __init__(
         self,
         model: str | None = None,
-        system_prompt: str | None = None,     # Runtime override; shadows class-level default
-        step_models: dict[str, str] | None = None,  # Per-step model overrides
-        **kwargs,
-    ):
-        self._model = model or self.default_model
-        self._step_models: dict[str, str] = step_models or {}
-        self._client = None  # Lazy init on first _extract() call
-        self._graph = None   # Lazy init on first run() call (multi-step agents)
-        if system_prompt is not None:
-            self.system_prompt = system_prompt
+        step_models: dict[str, str] | None = None,
+    ) -> None:
+        """Initialize agent instance.
+
+        Args:
+            model: Model to use for all steps (can be overridden by step_models)
+            step_models: Per-step model overrides
+        """
+        # Store instance-level model configuration
+        # Priority: explicit model > class default > config.resolve_model() (auto-detects from API key)
+        config = get_config()
+        self._model = model or self.default_model or config.resolve_model()
+        self._step_models = step_models or {}
+
+        # Initialize cached graph (lazy-built by _get_graph)
+        self._graph = None
+        # Thread-safe client initialization
+        self._client_lock = threading.Lock()
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -721,6 +735,7 @@ class AgentMetadata(BaseModel):
     requires_llm: bool
     default_model: str | None = None
     system_prompt: str = ""
+    step_prompts: dict[str, str] = {}    # per-step prompts (multi-step agents)
     input_schema: dict[str, Any] = {}
     output_schema: dict[str, Any] = {}
 ```
@@ -772,42 +787,67 @@ OutputT = TypeVar("OutputT", bound=BaseModel)
 
 class StepMetrics(BaseModel):
     """Cost and performance metrics for a single step in a multi-step agent."""
-    name: str                          # Step name (e.g. "analyze", "evaluate")
+    step_name: str                     # Step name (e.g. "analyze", "chunk")
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
     cost_usd: float = 0.0
-    latency_ms: float = 0.0
-    tokens_in: int = 0
-    tokens_out: int = 0
-    llm_calls: int = 0
+    latency_seconds: float = 0.0
+    model_used: str | None = None
     metadata: dict = Field(default_factory=dict)  # Step-specific extras
 
 
 class ExecutionMetrics(BaseModel):
     """Metrics collected by the lifecycle layer, NOT by the agent."""
-    latency_ms: float
+    run_id: UUID | None = None
+    latency_ms: float = 0.0
+    cost_usd: float = 0.0
     token_count_in: int = 0
     token_count_out: int = 0
     llm_calls: int = 0
-    cost_usd: float = 0.0
-    cache_hit: bool = False
     retry_count: int = 0
     fallback_used: str | None = None
+    cache_hit: bool = False
+    # Aggregated totals across all steps
+    total_cost_usd: float = 0.0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_tokens: int = 0
+    total_latency_seconds: float = 0.0
     # Multi-step agents: per-step breakdown
-    steps: list[StepMetrics] = Field(default_factory=list)
+    step_metrics: list[StepMetrics] = Field(default_factory=list)
+    refinement_loops: int = 0
     # Budget degradation tracking
-    degraded: bool = False
     degradation_reason: str | None = None
 
 
 class AgentResult(BaseModel, Generic[OutputT]):
-    """Wraps agent output with execution metadata."""
-    run_id: UUID
-    agent_name: str
-    agent_version: str
-    timestamp: datetime
-    output: OutputT
-    metrics: ExecutionMetrics
-    success: bool = True
+    """Wraps agent output with execution metadata.
+    
+    Semantics of success flag:
+    - `success=True, output=<value>`: Normal completion. Output may be full, partial, or 
+      degraded depending on the agent's design. When degradation occurs, error will contain 
+      the reason (e.g., "Partial result returned due to budget exceeded").
+    - `success=False, output=None`: Complete failure. No output available. The error field 
+      contains diagnostic information.
+    
+    Graceful degradation pattern (used by DeepSummarizer):
+    - An agent step fails partway through execution
+    - The agent returns the best partial result produced so far
+    - success=True (because we return something useful)
+    - error field explains what failed and why the result is partial
+    - Client can inspect success + error to understand degradation
+    """
+    output: OutputT | None = None
+    metrics: ExecutionMetrics | None = None
+    execution_metrics: ExecutionMetrics | None = None  # alias for metrics
+    run_id: UUID | None = None
+    agent_name: str | None = None
+    agent_version: str | None = None
+    timestamp: datetime | None = None
     error: str | None = None
+    success: bool = True
+```
 ```
 
 ### 3.5 Concrete Agent Examples
@@ -1062,31 +1102,58 @@ class Extractor(Agent[ExtractorInput, ExtractorOutput]):
 
 **Rule:** `system_prompt` captures the _identity_ of the agent (stable across calls). Per-input variation is _behavior_ and stays in `run()`.
 
-#### Runtime Override
+#### Immutability
 
-The `__init__` signature accepts `system_prompt` as an explicit keyword argument:
+`system_prompt` is a **ClassVar only**. It is not overrideable at init time. The identity and behavior of an agent are fixed when the class is defined. To use different system prompts, create different agent classes or use a wrapper pattern.
 
 ```python
-# Default prompt
+# system_prompt is immutable
 s = Summarizer()
 s.system_prompt  # "You are a summarization agent..."
 
-# Runtime override — instance attribute shadows class attribute
-s2 = Summarizer(system_prompt="Summarize for legal professionals. Preserve all citations.")
-s2.system_prompt  # "Summarize for legal professionals..."
+# This does NOT override system_prompt — not accepted as a parameter
+s2 = Summarizer(system_prompt="Different prompt")  # TypeError: unexpected keyword
 ```
 
-This is standard Python: instance attribute shadowing a class attribute. No descriptors, no metaclass magic.
+This enforces **P8 (stateless agents)**: the agent's behavior is determined at class definition time. Runtime customization happens through `step_prompts` (per-step guidance), not through `system_prompt` (agent identity).
+
+#### Customizing `step_prompts` at Init Time
+
+`step_prompts` is a **ClassVar** with default values. To customize per-step guidance for a specific instance, pass `step_prompts={"step_name": "custom prompt"}` to the agent's `__init__()`:
+
+```python
+from dopeagents.agents import DeepSummarizer
+
+# Default step_prompts (from ClassVar)
+agent1 = DeepSummarizer()
+
+# Custom step_prompts merged with defaults
+custom_prompts = {
+    "analyze": "Focus on technical terms and jargon.",
+    "evaluate": "Rate clarity and completeness (0.0–1.0)."
+}
+agent2 = DeepSummarizer(step_prompts=custom_prompts)
+
+# Both instances are independent
+agent1.run(input1)  # Uses default ClassVar step_prompts
+agent2.run(input2)  # Uses merged custom + default step_prompts
+```
+
+**How it works:**
+- The concrete agent class (e.g., `DeepSummarizer`) extracts `step_prompts` from `**kwargs` in its `__init__()`
+- Custom prompts are merged with ClassVar defaults: `self.step_prompts = {**self.step_prompts, **custom_prompts}`
+- Each instance gets its own `self.step_prompts` dict, shadowing the ClassVar
+- This respects **P8 (stateless agents)**: the behavior is fixed at instance creation, not modified at runtime
 
 #### What This Unlocks
 
-| Surface                    | Before                                                            | After                                                                  |
-| -------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| `.describe()` in Sandbox | No prompt shown                                                   | Prompt displayed; "(overridden)" suffix when runtime-overridden        |
-| `.debug()`               | System prompt captured only if `_render_prompt()` is overridden | `self.system_prompt` readable before constructing input              |
-| MCP Prompt primitive       | Hollow stub (no content without executing)                        | Real content via `_register_mcp_prompt()`                            |
-| Observability / tracing    | Requires Instructor hook interception                             | `agent.system_prompt` readable directly in span attributes           |
-| Benchmarking               | Prompt variation requires subclassing                             | Pass `system_prompt=` to constructor — prompt is a first-class axis |
+| Surface                    | Benefit                                                                    |
+| -------------------------- | -------------------------------------------------------------------------- |
+| `.describe()` in Sandbox | System prompt displayed; used in step descriptions                        |
+| `.debug()`               | `self.system_prompt` readable before constructing input messages          |
+| MCP Prompt primitive       | Real content via `_register_mcp_prompt()` — discoverable by MCP clients  |
+| Observability / tracing    | `agent.system_prompt` readable directly in span attributes                |
+| Benchmarking               | Prompt visible in comparisons; agent identity is immutable and reproducible |
 
 #### What NOT to Build
 
@@ -1096,6 +1163,7 @@ This is standard Python: instance attribute shadowing a class attribute. No desc
 | Auto-injection in `_extract()`      | Violates P2/P8. What you see in `run()` must be exactly what gets sent.                                                           |
 | Prompt versioning system              | Agent `version` already covers this. Bump the agent version when the prompt changes meaningfully.                                 |
 | `system_prompt` as a required field | Breaks `SchemaValidator` and any deterministic agent. Default stays `""`.                                                       |
+| Runtime override of `system_prompt` | Violates P8 (stateless). Agent identity is fixed at class time. Per-step variation uses `step_prompts` instead.                 |
 
 ---
 
@@ -2370,7 +2438,7 @@ Examples:
 
 ### 7.1 Tracer Interface
 
-> 📄 **File:** `dopeagents/observability/tracer.py` | **Status:** ○ Stub | **Role:** `Tracer` ABC, `Span`, `NoopTracer`, and `ConsoleTracer`
+> 📄 **File:** `dopeagents/observability/tracer.py` | **Status:** ● Implemented | **Role:** `Tracer` ABC, `Span`, `NoopTracer`, and `ConsoleTracer`
 
 ```python
 # dopeagents/observability/tracer.py
@@ -2424,7 +2492,7 @@ class ConsoleTracer(Tracer):
             print(f"[TRACE] ◀ {name} | {span.attributes}")
 ```
 
-> 📄 **File:** `dopeagents/observability/otel.py` | **Status:** ○ Stub | **Role:** OpenTelemetry-backed tracer bridging DopeAgents spans to OTel
+> 📄 **File:** `dopeagents/observability/otel.py` | **Status:** ● Implemented | **Role:** OpenTelemetry-backed tracer bridging DopeAgents spans to OTel
 
 ```python
 # dopeagents/observability/otel.py
@@ -2477,7 +2545,7 @@ class OTelTracer(Tracer):
 
 ### 7.2 Instructor Hooks Callback
 
-> 📄 **File:** `dopeagents/observability/instructor_hooks.py` | **Status:** ○ Not yet created | **Role:** Hooks into Instructor event system for LLM call observability
+> 📄 **File:** `dopeagents/observability/instructor_hooks.py` | **Status:** ● Implemented | **Role:** Hooks into Instructor event system for LLM call observability
 
 ```python
 # dopeagents/observability/instructor_hooks.py
@@ -2537,20 +2605,13 @@ class InstructorObservabilityHooks:
         client.on("parse:error", self.on_parse_error)
 ```
 
-### 7.3 Observability Contract
+### 7.3 Logging
 
-> 📄 **File:** `dopeagents/observability/contract.py` | **Status:** ○ Stub | **Role:** PII field declarations and custom metrics for observability
+> 📄 **File:** `dopeagents/observability/logging.py` | **Status:** ● Implemented | **Role:** `get_logger()` factory returning a named `logging.Logger` with configurable level
 
-```python
-# dopeagents/observability/contract.py
+> 📄 **File:** `dopeagents/observability/debug.py` | **Status:** ● Implemented | **Role:** `DebugInfo` model and debug-mode helpers for development-time introspection
 
-from pydantic import BaseModel
-
-
-class ObservabilityContract(BaseModel):
-    pii_fields: list[str] = []
-    custom_metrics: list[str] = []
-```
+> **Note:** The earlier `contract.py` design (PII field declarations on the observability layer) was superseded. PII redaction lives in `dopeagents/security/redaction.py` (§21). `logging.py` provides structured logger access; `debug.py` provides `DebugInfo` attached to `AgentResult` during development.
 
 ---
 
@@ -2558,7 +2619,7 @@ class ObservabilityContract(BaseModel):
 
 ### 8.1 Cost Tracker
 
-> 📄 **File:** `dopeagents/cost/tracker.py` | **Status:** ○ Stub | **Role:** Cumulative cost tracking per-agent and globally, thread-safe
+> 📄 **File:** `dopeagents/cost/tracker.py` | **Status:** ● Implemented | **Role:** Cumulative cost tracking per-agent and globally, thread-safe
 
 ```python
 # dopeagents/cost/tracker.py
@@ -2620,7 +2681,7 @@ class CostTracker:
 
 ### 8.2 Budget Guard
 
-> 📄 **File:** `dopeagents/cost/guard.py` | **Status:** ○ Stub | **Role:** Pre-execution budget checks with configurable per-call, per-step, per-agent, and global limits; supports degradation mode for multi-step agents
+> 📄 **File:** `dopeagents/cost/guard.py` | **Status:** ● Implemented | **Role:** Pre-execution budget checks with configurable per-call, per-step, per-agent, and global limits; supports degradation mode for multi-step agents
 
 ```python
 # dopeagents/cost/guard.py
@@ -2716,7 +2777,7 @@ connection failures) at the step level. Schema validation retries are handled
 automatically by Instructor within `_extract()` and do not count toward
 RetryPolicy attempts.
 
-> 📄 **File:** `dopeagents/resilience/retry.py` | **Status:** ○ Stub | **Role:** Configurable retry with backoff and retryable error types
+> 📄 **File:** `dopeagents/resilience/retry.py` | **Status:** ● Implemented | **Role:** Configurable retry with backoff and retryable error types
 
 ```python
 # dopeagents/resilience/retry.py
@@ -2738,7 +2799,7 @@ class RetryPolicy(BaseModel):
 
 ### 9.2 Fallback & Degradation Chains
 
-> 📄 **File:** `dopeagents/resilience/fallback.py` | **Status:** ○ Stub | **Role:** Ordered agent fallback with output compatibility validation, result includes `agent_used` and `degradation_reason`
+> 📄 **File:** `dopeagents/resilience/fallback.py` | **Status:** ● Implemented | **Role:** Ordered agent fallback with output compatibility validation, result includes `agent_used` and `degradation_reason`
 
 ```python
 # dopeagents/resilience/fallback.py
@@ -2770,7 +2831,7 @@ class FallbackChain:
 
 ```
 
-> 📄 **File:** `dopeagents/resilience/degradation.py` | **Status:** ○ Stub | **Role:** Specialized fallback ordering from most-capable to cheapest/most-reliable; executor result includes `agent_used` and `degradation_reason`
+> 📄 **File:** `dopeagents/resilience/degradation.py` | **Status:** ● Implemented | **Role:** Specialized fallback ordering from most-capable to cheapest/most-reliable; executor result includes `agent_used` and `degradation_reason`
 
 ```python
 # dopeagents/resilience/degradation.py
@@ -2835,7 +2896,7 @@ class DegradationChain(FallbackChain):
 
 ## 10. Caching Layer
 
-> 📄 **File:** `dopeagents/cache/manager.py` | **Status:** ○ Stub | **Role:** `CacheManager` ABC and `InMemoryCache` with TTL support
+> 📄 **File:** `dopeagents/cache/manager.py` | **Status:** ● Implemented | **Role:** `CacheManager` ABC and `InMemoryCache` with TTL support
 
 ```python
 # dopeagents/cache/manager.py
@@ -2895,7 +2956,7 @@ class InMemoryCache(CacheManager):
             self._store.clear()
 ```
 
-> 📄 **File:** `dopeagents/cache/disk.py` | **Status:** ○ Stub | **Role:** Persistent disk-based cache via `diskcache` (optional dependency)
+> 📄 **File:** `dopeagents/cache/disk.py` | **Status:** ● Implemented | **Role:** Persistent disk-based cache via `diskcache` (optional dependency)
 
 ```python
 # dopeagents/cache/disk.py
@@ -2935,6 +2996,10 @@ class DiskCache(CacheManager):
             self._cache.delete(key)
         else:
             self._cache.clear()
+
+    def close(self) -> None:
+        """Close the underlying diskcache connection."""
+        self._cache.close()
 ```
 
 ---
@@ -4100,7 +4165,7 @@ DopeAgents ships production-grade multi-step agents. The agent list is shaped by
 
 ### 17.1 DeepSummarizer
 
-> 📄 **File:** `dopeagents/agents/deep_summarizer.py` | **Status:** ○ Stub | **Role:** 7-step summarization workflow with chunking, synthesis, self-evaluation, and iterative refinement
+> 📄 **File:** `dopeagents/agents/deep_summarizer.py` | **Status:** ● Implemented | **Role:** 7-step summarization workflow with chunking, synthesis, self-evaluation, and iterative refinement
 
 **Steps (in order):**
 
@@ -4124,6 +4189,8 @@ class DeepSummarizerInput(BaseModel):
     max_length: int = Field(default=500, ge=50, le=10000)
     style: Literal["paragraph", "bullets", "tldr"] = "paragraph"
     focus: str | None = None
+    quality_threshold: float = Field(default=0.8, ge=0.0, le=1.0)  # min score before stopping refinement
+    max_refinement_loops: int = Field(default=3, ge=0, le=10)       # max evaluate→refine cycles
 
 class DeepSummarizerOutput(BaseModel):
     summary: str
@@ -4133,7 +4200,16 @@ class DeepSummarizerOutput(BaseModel):
     chunks_processed: int                            # number of chunks in the pipeline
     word_count: int
     truncated: bool
+    total_tokens_used: int = Field(default=0)        # approximate total tokens (when available)
 ```
+
+**Implementation Notes:**
+
+- `default_model` is `"groq/openai/gpt-oss-20b"`. Individual steps can be overridden via `step_models`.
+- Chunk summarization is **parallelized** using `ThreadPoolExecutor` with up to 4 workers when there are multiple chunks.
+- The evaluate→refine loop includes **plateau detection**: if the last two quality scores differ by < 0.02, refinement stops early.
+- Chunks are built from paragraph boundaries with 15% overlap; if no paragraph breaks exist, sentence-aware splitting is used.
+- `run()` returns `AgentResult[DeepSummarizerOutput]`. On graph execution failure, graceful degradation returns the best partial synthesis with `success=True` and the error detail in `AgentResult.error`.
 
 **Usage:**
 
@@ -4141,43 +4217,82 @@ class DeepSummarizerOutput(BaseModel):
 from dopeagents.agents import DeepSummarizer, DeepSummarizerInput
 
 agent = DeepSummarizer()
-output = agent.run(DeepSummarizerInput(text="...", max_length=400, style="bullets"))
-print(output.summary)
-print(f"Quality: {output.quality_score:.2f}, Refined {output.refinement_rounds}x")
+result = agent.run(DeepSummarizerInput(text="...", max_length=400, style="bullets"))
+print(result.output.summary)
+print(f"Quality: {result.output.quality_score:.2f}, Refined {result.output.refinement_rounds}x")
 ```
 
 ---
 
 ### 17.2 ResearchAgent
 
-> 📄 **File:** `dopeagents/agents/research_agent.py` | **Status:** ○ Stub | **Role:** 6-step research workflow with query planning, search, source evaluation, synthesis, and fact-checking
+> 📄 **File:** `dopeagents/agents/research_agent.py` | **Status:** ● Implemented | **Role:** 6-step research workflow with query expansion, search, source analysis, synthesis, evaluation, and refinement
 
 **Steps (in order):**
 
-| Step           | Purpose                                                  | Model strategy           |
-| -------------- | -------------------------------------------------------- | ------------------------ |
-| `formulate`  | Break the research question into sub-queries             | Smart (gpt-4o)           |
-| `search`     | Execute searches and collect candidate sources           | Fast/cheap + Tool        |
-| `evaluate`   | Score source credibility and relevance                   | Smart (gpt-4o)           |
-| `synthesize` | Write a draft research report from the top sources       | Smart (gpt-4o)           |
-| `fact_check` | Cross-reference key claims against multiple sources      | Smart (gpt-4o)           |
-| `compose`    | Format final report with citations and confidence scores | Fast/cheap (gpt-4o-mini) |
+| Step            | Purpose                                                       | LLM Strategy                    |
+| --------------- | ------------------------------------------------------------- | ------------------------------- |
+| `expand_query`  | Expand the research query into 3-5 refined search queries    | Default model                   |
+| `search`        | Find relevant sources using expanded queries                 | Default model + Search tool     |
+| `analyze`       | Analyze sources for credibility and key findings             | Default model (score 0-1)       |
+| `synthesize`    | Create evidence-based synthesis with citations               | Default model (quality-focused) |
+| `evaluate`      | Score quality on coverage, credibility, and coherence        | Default model (strict scorer)   |
+| `refine`        | Improve synthesis based on feedback (loops if needed)        | Default model (refinement-focused) |
+
+**Key Design:**
+- Uses LLM-driven query expansion instead of keyword expansion
+- Parallel source evaluation with credibility scoring
+- Self-evaluating loop: synthesize → evaluate → (refine if quality < threshold)
+- Configurable refinement loop limit and quality threshold
+- No external search API required (input text is analyzed directly by LLM)
 
 **Interfaces:**
 
 ```python
-class ResearchInput(BaseModel):
-    query: str = Field(min_length=5)
-    max_sources: int = Field(default=10, ge=2, le=50)
-    depth: Literal["quick", "standard", "deep"] = "standard"
+class ResearchAgentInput(BaseModel):
+    query: str = Field(min_length=5, description="Research query or topic")
+    research_focus: str | None = Field(
+        default=None,
+        description="Optional focus area (e.g., 'academic', 'recent news', 'practical')",
+    )
+    quality_threshold: float = Field(
+        default=0.75, ge=0.0, le=1.0,
+        description="Minimum quality score to accept without refinement",
+    )
+    max_refinement_loops: int = Field(
+        default=2, ge=0, le=5,
+        description="Maximum number of refinement iterations",
+    )
 
-class ResearchOutput(BaseModel):
-    report: str
-    sources: list[str]
-    confidence_scores: dict[str, float]  # Per source
-    citations: list[str]
-    fact_check_notes: list[str]
-    sub_queries_used: list[str]
+class ResearchAgentOutput(BaseModel):
+    synthesis: str = Field(description="Final research synthesis with citations")
+    key_findings: list[str] = Field(
+        default_factory=list, description="Top findings from research"
+    )
+    quality_score: float = Field(ge=0.0, le=1.0, description="Final quality score")
+    sources_analyzed: int = Field(ge=0, description="Number of sources analyzed")
+    refinement_rounds: int = Field(ge=0, description="Number of refinement loops")
+```
+
+**Reference Implementation:**
+
+```python
+from dopeagents.agents.research_agent import ResearchAgent, ResearchAgentInput
+
+agent = ResearchAgent()
+result = agent.run(
+    ResearchAgentInput(
+        query="What are the latest developments in quantum computing?",
+        research_focus="practical applications",
+        quality_threshold=0.8,
+        max_refinement_loops=3,
+    )
+)
+
+print(result.output.synthesis)
+print(f"Quality Score: {result.output.quality_score}")
+print(f"Refinement Loops: {result.output.refinement_rounds}")
+```
 ```
 
 **Usage:**
@@ -4204,89 +4319,80 @@ print(output.report)
 
 ```text
 dopeagents/
-├── __init__.py                   # Re-exports (__version__, Agent, core agents)
-├── py.typed                       # PEP 561 marker
-├── cli.py                         # CLI entry point (list/describe/run/dry-run/mcp serve)
+├── __init__.py                   ●  # Re-exports (__version__, Agent, core agents, errors, config)
+├── py.typed                       ●  # PEP 561 marker
+├── config.py                      ●  # DopeAgentsConfig (pydantic_settings) + get/set/reset_config()
+├── errors.py                      ●  # Full typed error hierarchy (real exceptions with model_dump_json())
+├── cli/
+│   ├── __init__.py               ●
+│   └── main.py                   ●  # CLI entry point (click-based)
 ├── core/
-│   ├── __init__.py            
-│   ├── agent.py                   # Agent base class + _extract() + adapter methods
-│   ├── context.py                 # AgentContext dataclass
-│   ├── types.py                   # AgentResult, ExtractionResult, ToolCall
-│   └── metadata.py                # AgentCard, Capability, CostPolicy
+│   ├── __init__.py               ●
+│   ├── agent.py                   ●  # Agent base class + _extract() + adapter methods
+│   ├── context.py                 ●  # AgentContext (Pydantic)
+│   ├── types.py                   ●  # AgentResult, ExecutionMetrics, StepMetrics
+│   ├── metadata.py                ●  # AgentMetadata (name, version, step_prompts, schemas)
+│   └── state.py                   ●  # Shared LangGraph state helpers
 ├── sandbox/
-│   ├── __init__.py             ○
-│   ├── runner.py               ○  # SandboxRunner + inspect_mcp()
-│   ├── display.py              ○  # SandboxDisplay (text formatting)
-│   └── repl.py                 ○  # Interactive REPL
+│   └── __init__.py               ○  # (planned) SandboxRunner + REPL
 ├── contracts/
-│   ├── __init__.py             ○
-│   ├── checker.py                 # ContractChecker (pre/post-conditions)
-│   ├── pipeline.py                # PipelineValidator (type compatibility)
-│   └── types.py                   # PreCondition, PostCondition, ContractResult
+│   ├── __init__.py               ●
+│   ├── checker.py                 ●  # ContractChecker (type compatibility validation)
+│   └── pipeline.py                ●  # Pipeline (multi-agent composition with build-time checks)
 ├── lifecycle/
-│   ├── __init__.py             ○
-│   ├── executor.py                # LifecycleExecutor (Instructor hooks)
-│   └── hooks.py                   # LifecycleHooks protocol
+│   ├── __init__.py               ●
+│   ├── executor.py                ●  # AgentExecutor (full lifecycle management)
+│   ├── hooks.py                   ●  # LifecycleHooks (pre/post/error/retry/instructor hooks)
+│   └── result.py                  ●  # Result helpers
 ├── observability/
-│   ├── __init__.py             ○
-│   ├── tracer.py               ○  # Tracer ABC + NoopTracer + ConsoleTracer
-│   ├── otel.py                 ○  # OTelTracer (OpenTelemetry integration)
-│   ├── instructor_hooks.py     ✧  # InstructorObservabilityHooks (not yet created)
-│   └── contract.py             ○  # ObservabilityContract model
+│   ├── __init__.py               ●
+│   ├── tracer.py                  ●  # Tracer ABC + Span + NoopTracer + ConsoleTracer
+│   ├── otel.py                    ●  # OTelTracer (OpenTelemetry integration)
+│   ├── instructor_hooks.py        ●  # InstructorObservabilityHooks (LLM event capture)
+│   ├── logging.py                 ●  # get_logger() (structured logging)
+│   └── debug.py                   ●  # Debug utilities
 ├── cost/
-│   ├── __init__.py             ○
-│   ├── tracker.py              ○  # CostTracker (per-call + cumulative)
-│   └── guard.py                ○  # CostGuard (budget enforcement)
+│   ├── __init__.py               ●
+│   ├── tracker.py                 ●  # CostTracker (per-agent + global, thread-safe)
+│   ├── guard.py                   ●  # BudgetConfig + BudgetGuard (enforcement)
+│   └── budget.py                  ○  # (stub) — BudgetConfig lives in guard.py
 ├── resilience/
-│   ├── __init__.py             ○
-│   ├── retry.py                ○  # RetryPolicy (exponential backoff)
-│   ├── fallback.py             ○  # FallbackChain (model cascade)
-│   └── degradation.py          ○  # GracefulDegradation (partial results)
+│   ├── __init__.py               ●
+│   ├── retry.py                   ●  # RetryPolicy (exponential backoff, Pydantic model)
+│   ├── fallback.py                ●  # FallbackChain (ordered agent fallback)
+│   └── degradation.py             ●  # DegradationChain + DegradationResult
 ├── cache/
-│   ├── __init__.py             ○
-│   ├── manager.py              ○  # CacheManager (get/set/invalidate)
-│   └── disk.py                 ○  # DiskCache (SQLite-backed TTL cache)
+│   ├── __init__.py               ●
+│   ├── manager.py                 ●  # CacheManager ABC + InMemoryCache (TTL)
+│   └── disk.py                    ●  # DiskCache (diskcache, persistent, close())
 ├── adapters/
-│   ├── __init__.py             ○
-│   ├── langchain.py            ○  # LangChain BaseTool wrapper
-│   ├── crewai.py               ○  # CrewAI agent adapter
-│   ├── autogen.py              ○  # AutoGen conversable-agent wrapper
-│   ├── openai_functions.py     ○  # OpenAI function-calling schema export
-│   ├── generic.py              ○  # GenericAdapter (arbitrary callables)
-│   ├── mcp.py                     # FastMCP adapter + server factory
-│   ├── wrap.py                 ○  # Universal wrap() helper
-│   └── simple.py                  # SimpleAdapter (dict I/O)
+│   ├── __init__.py               ●
+│   ├── langchain_adapter.py       ◐  # LangChain adapter (stub — raises NotImplementedError)
+│   ├── crewai_adapter.py          ◐  # CrewAI adapter (stub)
+│   ├── autogen_adapter.py         ◐  # AutoGen adapter (stub)
+│   ├── langgraph_adapter.py       ◐  # LangGraph adapter (stub)
+│   └── wrap.py                    ◐  # Universal wrap() helper (stub)
+├── mcp_server/
+│   ├── __init__.py               ●
+│   ├── server.py                  ◐  # MCP server factory (raises ImportError until fastmcp installed)
+│   └── registry.py                ○  # Agent registry for MCP exposure (stub)
 ├── spec/
-│   ├── __init__.py             ○
-│   ├── schema.py               ○  # SpecSchema (Pydantic → JSON Schema)
-│   ├── generator.py            ○  # SpecGenerator (Markdown/HTML output)
-│   └── validator.py            ○  # SpecValidator (contract verification)
+│   └── __init__.py               ○  # (planned) Agent Spec system
 ├── registry/
-│   ├── __init__.py             ○
-│   └── registry.py             ○  # AgentRegistry (singleton discovery)
+│   └── __init__.py               ○  # (planned) AgentRegistry
 ├── benchmark/
-│   ├── __init__.py             ○
-│   ├── suite.py                ○  # BenchmarkSuite (test case collection)
-│   ├── runner.py               ○  # BenchmarkRunner (execute + measure)
-│   └── results.py              ○  # BenchmarkResult (metrics aggregation)
+│   └── __init__.py               ○  # (planned) BenchmarkSuite + BenchmarkRunner
 ├── tools/
-│   ├── __init__.py             ○
-│   ├── base.py                 ○  # ToolSpec ABC
-│   ├── function.py             ○  # FunctionTool (wrap Python callables)
-│   ├── mcp.py                  ○  # MCPTool (consume external MCP servers)
-│   └── rest.py                 ○  # RESTTool (HTTP endpoint wrapper)
+│   └── __init__.py               ○  # (planned) Tool integration
 ├── agents/
-│   ├── __init__.py             ○
-│   ├── deep_summarizer.py         # 7-step summarization agent (Phase 1)
-│   ├── research_agent.py          # 6-step research agent (Phase 1)
-│   ├── document_analyst.py     ✧  # Multi-step document Q&A (Phase 2)
-│   ├── code_reviewer.py        ✧  # Multi-step code review (Phase 2)
-│   └── data_extractor.py       ✧  # Multi-step structured extraction (Phase 2)
-├── security/
-│   ├── __init__.py             ○
-│   └── redaction.py            ○  # PII pattern detection + field redaction
-├── errors.py                      # Full typed error hierarchy
-└── config.py                      # DopeAgentsConfig + env/TOML loading
+│   ├── __init__.py               ●
+│   ├── deep_summarizer.py         ●  # 7-step summarization agent — fully implemented (Phase 1)
+│   ├── research_agent.py          ○  # 6-step research agent — stub (Phase 1)
+│   └── agent_flows/
+│       └── deep_summarizer.mmd    ●  # Mermaid diagram of DeepSummarizer flow
+└── security/
+    ├── __init__.py               ●
+    └── redaction.py              ●  # PIIRedactor (regex patterns + field/text redaction)
 ```
 
 ### 18.1 Root `__init__.py` Re-exports
@@ -4294,254 +4400,264 @@ dopeagents/
 The root package re-exports the most commonly used symbols so users can write
 `from dopeagents import Agent, DeepSummarizer, ...` as shown in §23 API Reference.
 
-> 📄 **File:** `dopeagents/__init__.py` | **Status:**   Implemented
+> 📄 **File:** `dopeagents/__init__.py` | **Status:** ● Implemented
 
 ```python
 # dopeagents/__init__.py
 
-__version__ = "3.0.0"
+__version__ = "0.1.0"
 
-from dopeagents.core.agent import Agent
+# Core type system and agent interface
+from dopeagents.core.agent import Agent, DebugInfo, AgentDescription
 from dopeagents.core.context import AgentContext
+from dopeagents.core.metadata import AgentMetadata
 from dopeagents.core.types import AgentResult, ExecutionMetrics, StepMetrics
-from dopeagents.agents.deep_summarizer import DeepSummarizer
-from dopeagents.agents.research_agent import ResearchAgent
-from dopeagents.contracts.checker import ContractChecker
-from dopeagents.contracts.pipeline import Pipeline
-from dopeagents.adapters.simple import SimpleRunner
-from dopeagents.registry.registry import Registry, register
+
+# Error hierarchy
+from dopeagents.errors import (
+    DopeAgentsError,
+    ExtractionError,
+    ExtractionValidationError,
+    ExtractionProviderError,
+    CostError,
+    BudgetExceededError,
+    BudgetDegradedError,
+    ContractError,
+)
+
+# Configuration
+from dopeagents.config import DopeAgentsConfig, get_config, set_config, reset_config
+
+# Observability
+from dopeagents.observability.logging import get_logger
+
+# Agents (Phase 1)
+from dopeagents.agents import (
+    DeepSummarizer,
+    DeepSummarizerInput,
+    DeepSummarizerOutput,
+)
 
 __all__ = [
-    "Agent",
-    "AgentContext",
-    "AgentResult",
-    "ExecutionMetrics",
-    "StepMetrics",
-    "DeepSummarizer",
-    "ResearchAgent",
-    "ContractChecker",
-    "Pipeline",
-    "SimpleRunner",
-    "Registry",
-    "register",
+    "__version__",
+    # Core
+    "Agent", "AgentContext", "AgentMetadata",
+    "AgentResult", "ExecutionMetrics", "StepMetrics",
+    "DebugInfo", "AgentDescription",
+    # Errors
+    "DopeAgentsError", "ExtractionError", "ExtractionValidationError",
+    "ExtractionProviderError", "CostError", "BudgetExceededError",
+    "BudgetDegradedError", "ContractError",
+    # Configuration
+    "DopeAgentsConfig", "get_config", "set_config", "reset_config",
+    # Observability
+    "get_logger",
+    # Agents (Phase 1)
+    "DeepSummarizer", "DeepSummarizerInput", "DeepSummarizerOutput",
 ]
 ```
+
+> **Note:** `ResearchAgent`, `ContractChecker`, `Pipeline`, `Registry`, and `register` are not yet re-exported from the package root because their implementations are incomplete. They will be added to root imports in later phases.
 
 ---
 
 ## 19. Error Taxonomy
 
-> 📄 **File:** `dopeagents/errors.py` | **Status:**   Implemented | **Role:** Complete typed error hierarchy — contract, execution, extraction, cost, registry, tool, adapter, and MCP errors
+> 📄 **File:** `dopeagents/errors.py` | **Status:** ● Implemented | **Role:** Complete typed error hierarchy — real Python exceptions with structured attributes and `model_dump_json()` for serialization
+
+All errors inherit from `DopeAgentsError(Exception)`. They are **plain Python exceptions** (not Pydantic models), but expose a `model_dump_json()` method that mirrors the Pydantic `BaseModel` interface so inspection code is compatible.
 
 ```python
-# dopeagents/errors.py
+# dopeagents/errors.py  (condensed overview)
 
 class DopeAgentsError(Exception):
-    """Base exception for all DopeAgents errors."""
-    pass
+    """Base exception. Stores structured fields as instance attributes.
+    Exposes model_dump_json() / model_dump() for serialization."""
+    def __init__(self, message="", error_type=None, agent_name=None, original_error=None, **kwargs): ...
+    def model_dump_json(self) -> str: ...
+    def model_dump(self) -> dict: ...
 
-# Contract errors
-class ContractError(DopeAgentsError): pass
-class PipelineValidationError(ContractError): pass
-class InputValidationError(ContractError):
-    def __init__(self, agent_name, validation_error):
-        self.agent_name = agent_name
-        self.validation_error = validation_error
-        super().__init__(f"Input validation failed for '{agent_name}': {validation_error}")
-
-class OutputValidationError(ContractError):
-    def __init__(self, agent_name, output_data, validation_error):
-        self.agent_name = agent_name
-        self.output_data = output_data
-        self.validation_error = validation_error
-        super().__init__(f"Output validation failed for '{agent_name}': {validation_error}")
-
-# Execution errors
-class ExecutionError(DopeAgentsError): pass
-class AgentExecutionError(ExecutionError):
-    def __init__(self, agent_name, original_error):
-        self.agent_name = agent_name
-        self.original_error = original_error
-        super().__init__(f"Agent '{agent_name}' failed: {original_error}")
-
-class AllFallbacksFailedError(ExecutionError):
-    def __init__(self, chain_agents):
-        self.chain_agents = chain_agents
-        super().__init__(f"All fallback agents failed: {chain_agents}")
-
-# Cost errors
-class CostError(DopeAgentsError): pass
-class BudgetExceededError(CostError): pass
-
-# Registry errors
-class RegistryError(DopeAgentsError): pass
-class AgentNotFoundError(RegistryError):
-    def __init__(self, agent_name, version=None):
-        msg = f"Agent '{agent_name}'"
-        if version:
-            msg += f" version '{version}'"
-        super().__init__(f"{msg} not found in registry")
-
-class AgentValidationError(RegistryError): pass
-
-# Tool errors
-class ToolError(DopeAgentsError): pass
-class ToolExecutionError(ToolError):
-    def __init__(self, tool_name, original_error):
-        self.tool_name = tool_name
-        self.original_error = original_error
-        super().__init__(f"Tool '{tool_name}' failed: {original_error}")
-
-# Adapter errors
-class AdapterError(DopeAgentsError): pass
-class FrameworkNotInstalledError(AdapterError):
-    def __init__(self, framework, install_cmd):
-        self.framework = framework
-        self.install_cmd = install_cmd
-        super().__init__(f"{framework} required. Install: {install_cmd}")
-
-# MCP errors (NEW)
-class MCPError(DopeAgentsError): pass
-class MCPNotInstalledError(MCPError, AdapterError):
-    def __init__(self):
-        super().__init__(
-            "FastMCP is required for MCP support. Install with: pip install dopeagents[mcp]"
-        )
-
-class MCPRegistrationError(MCPError):
-    def __init__(self, agent_name, reason):
-        self.agent_name = agent_name
-        self.reason = reason
-        super().__init__(
-            f"Failed to register agent '{agent_name}' as MCP tool: {reason}"
-        )
-
-class MCPServerError(MCPError):
-    def __init__(self, reason):
-        super().__init__(f"MCP server error: {reason}")
-
-# Instructor errors (NEW)
+# ── Extraction layer ─────────────────────────────────────────
 class ExtractionError(DopeAgentsError): pass
-class ExtractionValidationError(ExtractionError):
-    """Instructor exhausted max_retries and still couldn't get valid output."""
-    def __init__(self, agent_name, response_model, original_error):
-        self.agent_name = agent_name
-        self.response_model = response_model
-        self.original_error = original_error
-        super().__init__(
-            f"Agent '{agent_name}' extraction failed after max retries. "
-            f"Expected schema: {response_model.__name__}. Error: {original_error}"
-        )
+class ExtractionValidationError(ExtractionError): pass  # Instructor exhausted retries
+class ExtractionProviderError(ExtractionError): pass    # Rate limit, auth, etc.
 
-class ExtractionProviderError(ExtractionError):
-    """The LLM provider returned an error (auth, rate limit, etc.)."""
-    def __init__(self, agent_name, provider, original_error):
-        self.agent_name = agent_name
-        self.provider = provider
-        self.original_error = original_error
-        super().__init__(
-            f"Agent '{agent_name}' provider '{provider}' error: {original_error}"
-        )
+# ── Cost & budget ───────────────────────────────────────────
+class CostError(DopeAgentsError): pass
+class BudgetExceededError(CostError): pass        # on_exceeded="error"
+class BudgetDegradedError(CostError): pass        # on_exceeded="degrade" (carries degraded_output)
+class TokenCountError(CostError): pass            # Token counting failed
+
+# ── Orchestration & graph ────────────────────────────────────
+class OrchestrationError(DopeAgentsError): pass   # Base for graph errors
+class GraphConstructionError(OrchestrationError): pass  # _build_graph() failed
+class GraphExecutionError(OrchestrationError): pass     # Step raised inside graph (step_name attr)
+
+# ── Contract & composition ──────────────────────────────────
+class ContractError(DopeAgentsError): pass
+class IncompatibleAgentsError(ContractError): pass      # Type incompatibility
+class PipelineValidationError(ContractError): pass      # Multi-agent pipeline invalid
+class InputValidationError(DopeAgentsError): pass       # agent.run() input schema mismatch
+class OutputValidationError(DopeAgentsError): pass      # agent.run() output schema mismatch
+
+# ── Type & introspection ────────────────────────────────────
+class TypeResolutionError(DopeAgentsError): pass        # Cannot resolve InputT/OutputT
+class SchemaExtractionError(DopeAgentsError): pass      # Pydantic schema extraction failed
+
+# ── Configuration ────────────────────────────────────────────
+class ConfigError(DopeAgentsError): pass
+class ConfigNotFoundError(ConfigError): pass
+class ConfigValidationError(ConfigError): pass
+
+# ── Framework adapters ────────────────────────────────────────
+class AdapterError(DopeAgentsError): pass
+class FrameworkNotInstalledError(AdapterError): pass
+class AdapterUnsupportedError(AdapterError): pass
+
+# ── MCP & protocol ───────────────────────────────────────────
+class MCPError(DopeAgentsError): pass
+class ToolRegistrationError(MCPError): pass       # failed to register as MCP tool
+
+# ── Sandbox ──────────────────────────────────────────────────
+class SandboxError(DopeAgentsError): pass
+class SandboxTimeoutError(SandboxError): pass
+class SandboxResourceError(SandboxError): pass
+
+# ── Resilience & retry ────────────────────────────────────────
+class ResilienceError(DopeAgentsError): pass
+class MaxRetriesExceededError(ResilienceError): pass
+class DegradationError(DopeAgentsError): pass     # DegradationChain fully exhausted
+
+# ── Cache ─────────────────────────────────────────────────────
+class CacheError(DopeAgentsError): pass
+class CacheKeyError(CacheError): pass
+class CacheStoreError(CacheError): pass
+
+# ── Execution ─────────────────────────────────────────────────
+class AgentExecutionError(DopeAgentsError): pass  # agent.run() raised an exception
+class AllFallbacksFailedError(DopeAgentsError): pass  # every chain agent failed
+
+# ── Registry ──────────────────────────────────────────────────
+class RegistryError(DopeAgentsError): pass
+class AgentNotFoundError(RegistryError): pass
+class RegistryConflictError(RegistryError): pass
+
+# ── Benchmark ─────────────────────────────────────────────────
+class BenchmarkError(DopeAgentsError): pass
+class MetricComputationError(BenchmarkError): pass
+
+# ── Security & PII ──────────────────────────────────────────────
+class SecurityError(DopeAgentsError): pass
+class PIIDetectionError(SecurityError): pass
+class PIIRedactionError(SecurityError): pass
 ```
+
+> **Implementation note:** Errors use instance attributes (not Pydantic fields) for structured data, but expose `model_dump()` and `model_dump_json()` for compatibility with code that expects Pydantic-like serialisation. All kwargs passed to constructors are stored as instance attributes.
 
 ---
 
 ## 20. Configuration System
 
-> 📄 **File:** `dopeagents/config.py` | **Status:**   Implemented | **Role:** `DopeAgentsConfig` with env var and TOML loading, global singleton via `get_config()`/`set_config()`
+> 📄 **File:** `dopeagents/config.py` | **Status:** ● Implemented | **Role:** `DopeAgentsConfig` (backed by `pydantic_settings.BaseSettings`) with automatic `DOPEAGENTS_*` env var reading, `.env` file support, and thread-safe global singleton via `get_config()` / `set_config()` / `reset_config()`
 
 ```python
 # dopeagents/config.py
 
-from pydantic import BaseModel, Field
-from typing import Literal
+from pydantic_settings import BaseSettings
+from typing import Optional
+import threading
 
 
-class DopeAgentsConfig(BaseModel):
-    # Model / Extraction
-    default_model: str = "openai/gpt-4o-mini"
-    default_extraction_max_retries: int = 3
-    default_budget: float | None = None
-    tracer_type: Literal["noop", "console", "otel"] = "noop"
-    cache_enabled: bool = False
-    cache_type: Literal["memory", "disk"] = "memory"
-    cache_ttl: int = 3600
-    cache_directory: str = ".dopeagents_cache"
-    default_retry_max_attempts: int = 3
-    default_retry_delay: float = 1.0
-    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
-    redact_pii_in_logs: bool = True
+class DopeAgentsConfig(BaseSettings):
+    """Reads from DOPEAGENTS_* env vars and optional .env file automatically."""
+
+    # Model & API
+    default_model: str = "gpt-4o"
+    api_key: Optional[str] = None
+    api_base: Optional[str] = None
+
+    # Cost management
+    enable_cost_tracking: bool = True
+    max_cost_per_call: Optional[float] = None
+    max_cost_per_step: Optional[float] = None
+    max_cost_global: Optional[float] = None
+    default_cost_exceeded_action: str = "error"  # 'error' or 'degrade'
+
+    # Observability
+    enable_step_metrics: bool = True
+    tracer_type: str = "console"  # 'console', 'otel', or 'noop'
+    otel_endpoint: Optional[str] = None
+    log_prompts: bool = False
+    log_color: bool = True
+    log_level: str = "INFO"
+
+    # Retry & resilience
+    enable_retry: bool = True
+    max_retries: int = 3
+    retry_base_delay_seconds: float = 1.0
+
+    # Caching
+    enable_cache: bool = False
+    cache_backend: str = "memory"  # 'memory' or 'disk'
+    cache_dir: Optional[str] = None
+
+    # Security
+    enable_pii_redaction: bool = True
+    redaction_patterns: list[str] = []
 
     # Sandbox
-    sandbox_default_model: str | None = None
-    sandbox_output_format: Literal["text", "json"] = "text"
+    sandbox_enabled: bool = False
+    sandbox_timeout_seconds: float = 300.0
 
-    # MCP
-    mcp_server_name: str = "DopeAgents"
-    mcp_default_transport: Literal["stdio", "streamable-http"] = "stdio"
-    mcp_http_port: int = 8000
+    # Development & debug
+    debug_mode: bool = False
+    strict_type_checking: bool = True
+
+    class Config:
+        env_prefix = "DOPEAGENTS_"
+        env_file = ".env"
+        case_sensitive = False
 
     @classmethod
     def from_env(cls) -> "DopeAgentsConfig":
-        import os
-        kwargs = {}
-        env_mapping = {
-            "DOPEAGENTS_DEFAULT_MODEL": "default_model",
-            "DOPEAGENTS_EXTRACTION_MAX_RETRIES": "default_extraction_max_retries",
-            "DOPEAGENTS_DEFAULT_BUDGET": "default_budget",
-            "DOPEAGENTS_TRACER": "tracer_type",
-            "DOPEAGENTS_CACHE_ENABLED": "cache_enabled",
-            "DOPEAGENTS_LOG_LEVEL": "log_level",
-            "DOPEAGENTS_SANDBOX_MODEL": "sandbox_default_model",
-            "DOPEAGENTS_SANDBOX_OUTPUT": "sandbox_output_format",
-            "DOPEAGENTS_MCP_SERVER_NAME": "mcp_server_name",
-            "DOPEAGENTS_MCP_TRANSPORT": "mcp_default_transport",
-            "DOPEAGENTS_MCP_PORT": "mcp_http_port",
-        }
-        for env_var, field_name in env_mapping.items():
-            value = os.environ.get(env_var)
-            if value is not None:
-                field_info = cls.model_fields[field_name]
-                if field_info.annotation is bool:
-                    kwargs[field_name] = value.lower() in ("true", "1", "yes")
-                elif field_info.annotation is float or field_info.annotation == float | None:
-                    kwargs[field_name] = float(value)
-                elif field_info.annotation is int:
-                    kwargs[field_name] = int(value)
-                else:
-                    kwargs[field_name] = value
-        return cls(**kwargs)
-
-    @classmethod
-    def from_toml(cls, path: str = "dopeagents.toml") -> "DopeAgentsConfig":
-        import tomllib
-        from pathlib import Path
-        config_path = Path(path)
-        if config_path.exists():
-            with open(config_path, "rb") as f:
-                data = tomllib.load(f)
-            return cls(**data.get("dopeagents", {}))
+        """Load from DOPEAGENTS_* env vars (and optional .env file)."""
         return cls()
 
 
-_config: DopeAgentsConfig | None = None
+# Thread-safe global singleton
+_config_lock = threading.Lock()
+_default_config: Optional[DopeAgentsConfig] = None
+
 
 def get_config() -> DopeAgentsConfig:
-    global _config
-    if _config is None:
-        _config = DopeAgentsConfig.from_env()
-    return _config
+    """Return the global config singleton (thread-safe, lazy-init)."""
+    global _default_config
+    if _default_config is None:
+        with _config_lock:
+            if _default_config is None:
+                _default_config = DopeAgentsConfig.from_env()
+    return _default_config
+
 
 def set_config(config: DopeAgentsConfig) -> None:
-    global _config
-    _config = config
+    """Replace the global config (thread-safe)."""
+    global _default_config
+    with _config_lock:
+        _default_config = config
+
+
+def reset_config() -> None:
+    """Reset to defaults (useful in tests)."""
+    global _default_config
+    with _config_lock:
+        _default_config = None
 ```
 
 ---
 
 ## 21. Security & PII Handling
 
-> 📄 **File:** `dopeagents/security/redaction.py` | **Status:** ○ Stub | **Role:** Regex-based PII detection and field-level redaction for logs and observability
+> 📄 **File:** `dopeagents/security/redaction.py` | **Status:** ● Implemented | **Role:** Regex-based PII detection and field-level redaction for logs and observability
 
 ```python
 # dopeagents/security/redaction.py
@@ -4598,16 +4714,21 @@ Phase 1: Core Thesis (ship this first)                        [◐ in progress]
   ● _extract() per step (Instructor + LiteLLM)
   ● Pipeline with typed composition checks
   ● Step-level cost tracking + budget guards (on_exceeded="degrade")
-  ● MCP exposure (FastMCP ≥ 3.0)
-  ◐ DeepSummarizer (7-step) + ResearchAgent (6-step)
-  ◐ Adapters shipped: plain Python + MCP only
+  ● DeepSummarizer (7-step) — implemented, parallel chunking, plateau detection
+  ◐ MCP exposure (FastMCP ≥ 3.0) — server scaffold, requires fastmcp install
+  ◐ Adapters shipped: plain Python stubs only (LangChain/CrewAI/AutoGen stubs)
+  ○ ResearchAgent (6-step)
 
-Phase 2: Production Breadth                                    [○ not started]
+Phase 2: Production Breadth                                    [◐ in progress]
+  ● Observability (ConsoleTracer, OTelTracer, InstructorObservabilityHooks)
+  ● PII redaction (PIIRedactor, regex-based field + pattern redaction)
+  ● Resilience (RetryPolicy, FallbackChain, DegradationChain, DegradationResult)
+  ● Caching layer (InMemoryCache, DiskCache with TTL + close())
+  ● Error hierarchy (DopeAgentsError + 30+ typed subclasses)
+  ● Configuration system (DopeAgentsConfig via pydantic_settings)
   ○ Additional agents (DocumentAnalyst, CodeReviewer, DataExtractor)
   ○ Benchmark runner + evaluation suite
   ○ Agent Sandbox (runner + REPL + CLI dry-run)
-  ○ Observability (tracer, Instructor hooks, PII redaction)
-  ○ Retry, fallback, DegradationChain, caching
   ○ Additional framework adapters (LangChain, CrewAI, AutoGen)
   ○ wrap_function / wrap_class for external agents
 
@@ -4624,16 +4745,34 @@ Phase 3: Ecosystem                                             [○ not started]
 
 ```python
 # Core
-from dopeagents import Agent, AgentContext, AgentResult, SimpleRunner
-from dopeagents import Pipeline, ContractChecker
+from dopeagents import Agent, AgentContext, AgentMetadata, AgentResult
+from dopeagents import DebugInfo, AgentDescription
 from dopeagents.core.types import ExecutionMetrics, StepMetrics
+
+# Errors
+from dopeagents.errors import (
+    DopeAgentsError, ContractError,
+    InputValidationError, OutputValidationError,
+    AgentExecutionError, AllFallbacksFailedError,
+    BudgetExceededError, BudgetDegradedError,
+    ExtractionError, ExtractionValidationError, ExtractionProviderError,
+    CostError, TokenCountError,
+    OrchestrationError, GraphConstructionError, GraphExecutionError,
+    AdapterError, FrameworkNotInstalledError, AdapterUnsupportedError,
+    MCPError, ToolRegistrationError,
+    ResilienceError, MaxRetriesExceededError, DegradationError,
+    CacheError, CacheKeyError, CacheStoreError,
+    SecurityError, PIIDetectionError, PIIRedactionError,
+    ConfigError, ConfigNotFoundError, ConfigValidationError,
+)
+
+# Config
+from dopeagents.config import DopeAgentsConfig, get_config, set_config, reset_config
+from dopeagents.observability.logging import get_logger
 
 # Agents (Phase 1)
 from dopeagents.agents import DeepSummarizer, DeepSummarizerInput, DeepSummarizerOutput
-from dopeagents.agents import ResearchAgent, ResearchInput, ResearchOutput
-
-# Agents (Phase 2 — coming soon)
-# from dopeagents.agents import DocumentAnalyst, CodeReviewer, DataExtractor
+# ResearchAgent is a planned Phase 1 agent (stub only)
 
 # Lifecycle
 from dopeagents.lifecycle import AgentExecutor, LifecycleHooks
@@ -4652,43 +4791,15 @@ from dopeagents.resilience import DegradationResult
 # Cache
 from dopeagents.cache import CacheManager, InMemoryCache, DiskCache
 
-# Tools
-from dopeagents.tools import Tool, RESTTool, MCPTool
+# Security
+from dopeagents.security import PIIRedactor
 
-# MCP Adapter
-from dopeagents.adapters.mcp import (
-    create_mcp_server,
-    create_single_agent_mcp_server,
-    register_agent_as_mcp_tool,
-)
+# MCP Server (requires: pip install dopeagents[mcp])
+from dopeagents.mcp_server import server  # FastMCP-based MCP server
 
-# Registry
-from dopeagents import Registry, register
-
-# Wrapping
-from dopeagents.adapters.wrap import wrap_function, wrap_class
-
-# Sandbox
-from dopeagents.sandbox import SandboxRunner, SandboxDisplay
-from dopeagents.sandbox.runner import ComparisonResult, ComparisonRow
-
-# Benchmark
-from dopeagents.benchmark import BenchmarkSuite, BenchmarkRunner, BenchmarkResult
-
-# Config
-from dopeagents.config import DopeAgentsConfig, get_config, set_config
-
-# Errors
-from dopeagents.errors import (
-    DopeAgentsError, ContractError, PipelineValidationError,
-    InputValidationError, OutputValidationError,
-    ExecutionError, AgentExecutionError, AllFallbacksFailedError,
-    BudgetExceededError, BudgetDegradedError, AgentNotFoundError,
-    FrameworkNotInstalledError,
-    MCPError, MCPNotInstalledError, MCPRegistrationError, MCPServerError,
-    ExtractionError, ExtractionValidationError, ExtractionProviderError,
-    ToolError, ToolExecutionError, AdapterError,
-)
+# The following are planned for later phases and not yet exported:
+# ContractChecker, Pipeline, Registry, register, SimpleRunner
+# wrap_function, wrap_class, BenchmarkSuite, SandboxRunner
 ```
 
 ---
@@ -4731,7 +4842,7 @@ from dopeagents.errors import (
 | DD-032 | Observability uses Instructor hooks plus LiteLLM metadata                             | Instructor hooks capture request/response events; cost is sourced from LiteLLM's `response_cost` metadata when present.                                                                                                                                                                                               |
 | DD-033 | `system_prompt` is a `ClassVar[str]` on the base class                            | Makes the system prompt inspectable without execution:`.describe()`, MCP Prompt primitive, observability spans, and benchmarking all read `agent.system_prompt` directly. Default is `""`.                                                                                                                        |
 | DD-034 | Explicit reference over auto-injection for `system_prompt`                          | Agent writes `{"role": "system", "content": self.system_prompt}` in `run()`. `_extract()` is unchanged. What you read in `run()` is exactly what gets sent. Preserves P2 and P8.                                                                                                                                |
-| DD-035 | `system_prompt` accepts a runtime override in `__init__`                          | `Summarizer(system_prompt="...")` shadows the class-level default via normal Python instance attribute shadowing. No descriptors or metaclass magic. Enables prompt variation as a benchmarking axis without subclassing.                                                                                             |
+| DD-035 | `step_prompts` accepts optional customization at init-time, not runtime                       | `Summarizer(step_prompts={"analyze": "..."})` shadows the class-level defaults via normal Python instance attribute shadowing. Enables per-instance prompt variation (e.g., strict vs. lenient analyzers) without subclassing. `system_prompt` remains immutable (ClassVar only). Pure functions: same object + same input = same output.                                                                                            |
 | DD-036 | `__init_subclass__` validates `system_prompt` type and warns on missing prompts   | Type error raised early for non-string declarations. Warning (not error) fired when `requires_llm=True` and no `system_prompt` is set, to preserve compatibility with agents that use dynamic `@property` prompts.                                                                                                |
 | DD-037 | LangGraph is a private implementation detail, never exposed to callers                | `_build_graph()` returns a compiled LangGraph `StateGraph`. Users call `agent.run(input)` — they never import or configure LangGraph directly. This preserves the clean single-method contract (INV-1) while enabling multi-step orchestration with cycles, conditional edges, and state-driven flow.            |
 | DD-038 | `step_prompts: ClassVar[dict[str, str]]` for per-step prompt declarations           | Declaring step prompts as class-level attributes (not in `run()`) makes them inspectable without execution: `describe()` reads them, MCP Prompt primitives can surface them, and benchmarks can vary them independently. Class-level storage follows the same pattern as `system_prompt` (DD-033).                |

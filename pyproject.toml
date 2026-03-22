@@ -86,6 +86,7 @@ dev = [
     "ruff>=0.3",
     "black>=24.1",
     "isort>=5.13",
+    "pre-commit>=3.0",
 ]
 
 [project.scripts]
@@ -147,6 +148,7 @@ ignore = [
     "E501",   # line too long (handled by ruff format)
     "ARG001", # unused method argument (false positives)
     "B008",   # function call in default argument
+    "I001",   # import sorting conflicts with isort - isort is the source of truth
 ]
 
 [tool.ruff.lint.isort]
@@ -171,11 +173,13 @@ disallow_untyped_calls = true
 disallow_incomplete_defs = true
 check_untyped_defs = true
 no_implicit_optional = true
+explicit_package_bases = true
 exclude = [
     ".venv",
     "build",
     "dist",
     "docs",
+    "dopeagents.egg-info",
 ]
 
 [[tool.mypy.overrides]]
@@ -188,8 +192,13 @@ module = [
     "pyautogen.*",
     "crewai.*",
     "openai.*",
+    "diskcache.*",
 ]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
 
 [tool.black]
 line-length = 100
@@ -209,7 +218,6 @@ extend-exclude = '''
 profile = "black"
 line_length = 100
 known_first_party = ["dopeagents"]
-multi_line_mode = 3
 include_trailing_comma = true
 force_grid_wrap = 0
 use_parentheses = true

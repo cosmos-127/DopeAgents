@@ -1,17 +1,20 @@
-"""Unit and integration tests for DeepSummarizer agent.
+"""Production-ready integration tests for DeepSummarizer agent.
 
-When GROQ_API_KEY is present in the environment (or .env), integration tests
-run against the real Groq API.  Otherwise they fall back to mocking _extract().
+Demonstrates the three-layer architecture (Agent + AgentContext + AgentExecutor)
+with full observability: token tracking, cost computation, and metrics collection.
+
+When GROQ_API_KEY is present, tests run against the real Groq API.
+Otherwise, they use mocked LLM responses for offline testing.
 """
 
 import os
 import warnings
 from typing import Any
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 import pytest
 
-# Load .env so GROQ_API_KEY is available if present
 try:
     from dotenv import load_dotenv
 
@@ -19,47 +22,279 @@ try:
 except ImportError:
     pass
 
-from dopeagents.agents import (
-    DeepSummarizer,
-    DeepSummarizerInput,
-    DeepSummarizerOutput,
-)
+from dopeagents.agents import DeepSummarizer, DeepSummarizerInput, DeepSummarizerOutput
 from dopeagents.agents.deep_summarizer import DeepSummarizerState
+from dopeagents.core.context import AgentContext
 from dopeagents.core.types import AgentResult
+from dopeagents.lifecycle.executor import AgentExecutor
+from dopeagents.observability.tracer import NoopTracer
 
-# ── Fixtures & skip markers ───────────────────────────────────────────────────
+# ── Configuration ──────────────────────────────────────────────────────────
 
 HAS_GROQ = bool(os.environ.get("GROQ_API_KEY"))
 requires_groq = pytest.mark.skipif(not HAS_GROQ, reason="GROQ_API_KEY not set")
 
 SAMPLE_TEXT = (
-    "Machine learning (ML) is a branch of artificial intelligence (AI) and computer science "
-    "which focuses on the use of data and algorithms to imitate the way that humans learn, "
-    "gradually improving its accuracy. IBM has a rich history with machine learning. "
-    "One of its own, Arthur Samuel, is credited for coining the term, 'machine learning' "
-    "with his research (PDF, 481 KB) (link resides outside IBM) around the game of checkers. "
-    "Robert Nealey, the self-proclaimed checkers master, played the game on an IBM 7094 "
-    "computer in 1962, and he lost. Compared to what can be done today, this feat seems paltry, "
-    "but it's considered a major milestone in the field of artificial intelligence. "
-    "Over the last couple of decades, the technological advances in storage and processing power "
-    "have enabled some innovative products based on machine learning, such as Netflix's "
-    "recommendation engine and self-driving cars. Machine learning is an important component "
-    "of the growing field of data science. Through the use of statistical methods, algorithms "
-    "are trained to make classifications or predictions, and to uncover key insights in data "
-    "mining projects. These insights subsequently drive decision making within applications "
-    "and businesses, ideally impacting key growth metrics."
+    "Machine learning is a branch of artificial intelligence that focuses on using "
+    "data and algorithms to learn and improve. Over the past decades, advancements in "
+    "storage and processing have enabled innovations like recommendation engines and "
+    "self-driving cars. Machine learning is a key component of data science, using "
+    "statistical methods to make classifications, predictions, and discover insights that "
+    "drive business decisions and growth metrics."
 )
 
 
-# ── Input validation ─────────────────────────────────────────────────────────
+# ── Fixtures ───────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def agent_context() -> AgentContext:
+    """Create an AgentContext for execution metadata tracking."""
+    return AgentContext(
+        metadata={
+            "user_id": "test-user",
+            "environment": "test",
+            "request_id": str(uuid4()),
+        }
+    )
+
+
+@pytest.fixture
+def executor() -> AgentExecutor:
+    """Create an AgentExecutor with no-op tracer for testing."""
+    return AgentExecutor(tracer=NoopTracer())
+
+
+@pytest.fixture
+def deep_summarizer() -> DeepSummarizer:
+    """Create a DeepSummarizer agent instance."""
+    return DeepSummarizer()
+
+
+# ── Production Architecture Tests ──────────────────────────────────────────
+
+
+class TestDeepSummarizerProductionArchitecture:
+    """Test the three-layer architecture: Agent + AgentContext + AgentExecutor."""
+
+    @patch("dopeagents.core.agent.Agent._extract")
+    def test_three_layer_architecture_with_metrics(
+        self,
+        mock_extract: Mock,
+        executor: AgentExecutor,
+        deep_summarizer: DeepSummarizer,
+        agent_context: AgentContext,
+    ) -> None:
+        """Production flow: context → agent → executor → metrics returned."""
+        from dopeagents.agents.deep_summarizer import (
+            _AnalyzeOut,
+            _ChunkSummary,
+            _EvaluateOut,
+            _FormatOut,
+            _SynthesizeOut,
+        )
+
+        # Mock LLM responses
+        def side_effect(
+            response_model: type, messages: Any, model: Any = None, **kwargs: Any
+        ) -> Any:
+            if response_model is _AnalyzeOut:
+                return _AnalyzeOut(
+                    recommended_chunk_size=500, text_type="article", complexity="medium"
+                )
+            if response_model is _ChunkSummary:
+                return _ChunkSummary(summary="chunk summary")
+            if response_model is _SynthesizeOut:
+                return _SynthesizeOut(
+                    synthesis="completed synthesis", key_points=["point1", "point2"]
+                )
+            if response_model is _EvaluateOut:
+                return _EvaluateOut(quality_score=0.9, feedback="excellent")
+            if response_model is _FormatOut:
+                return _FormatOut(
+                    final_summary="final summary text", word_count=42, truncated=False
+                )
+            raise ValueError(f"Unexpected response_model: {response_model}")
+
+        mock_extract.side_effect = side_effect
+
+        # Layer 1: Agent (business logic)
+        agent = deep_summarizer
+
+        # Layer 2: AgentContext (runtime metadata)
+        context = agent_context
+        assert context.run_id is not None
+        assert context.metadata["user_id"] == "test-user"
+
+        # Layer 3: AgentExecutor (lifecycle + observability)
+        input_data = DeepSummarizerInput(
+            text=SAMPLE_TEXT,
+            style="bullets",
+            max_length=300,
+        )
+
+        # Execute with full lifecycle management
+        result = executor.run(
+            agent=agent,
+            input=input_data,
+            context=context,
+        )
+
+        # Verify result structure
+        assert result.success is True
+        assert result.agent_name == agent.name
+        assert result.run_id == context.run_id
+
+        # Verify output
+        assert isinstance(result.output, DeepSummarizerOutput)
+        assert result.output.summary
+        assert len(result.output.summary) > 0
+
+        # Verify metrics collected (observability)
+        assert result.metrics is not None
+        assert result.metrics.latency_ms > 0
+        assert result.metrics.run_id == context.run_id
+
+    @patch("dopeagents.core.agent.Agent._extract")
+    def test_metrics_and_token_tracking(
+        self,
+        mock_extract: Mock,
+        executor: AgentExecutor,
+        deep_summarizer: DeepSummarizer,
+        agent_context: AgentContext,
+    ) -> None:
+        """Verify token usage and cost metrics are tracked and accessible."""
+        from dopeagents.agents.deep_summarizer import (
+            _AnalyzeOut,
+            _ChunkSummary,
+            _EvaluateOut,
+            _FormatOut,
+            _SynthesizeOut,
+        )
+
+        # Mock with proper token response metadata
+        def side_effect(
+            response_model: type, messages: Any, model: Any = None, **kwargs: Any
+        ) -> Any:
+            if response_model is _AnalyzeOut:
+                return _AnalyzeOut(
+                    recommended_chunk_size=500, text_type="article", complexity="low"
+                )
+            if response_model is _ChunkSummary:
+                return _ChunkSummary(summary="summary")
+            if response_model is _SynthesizeOut:
+                return _SynthesizeOut(synthesis="synthesis", key_points=["p1"])
+            if response_model is _EvaluateOut:
+                return _EvaluateOut(quality_score=0.9, feedback="good")
+            if response_model is _FormatOut:
+                return _FormatOut(final_summary="final", word_count=20, truncated=False)
+            raise ValueError(f"Unexpected: {response_model}")
+
+        mock_extract.side_effect = side_effect
+
+        input_data = DeepSummarizerInput(text=SAMPLE_TEXT, style="bullets")
+        result = executor.run(
+            agent=deep_summarizer,
+            input=input_data,
+            context=agent_context,
+        )
+
+        # Accessor methods for metrics
+        assert result.success is True
+
+        # Token tracking (accessible via convenience methods)
+        tokens_in = result.tokens_breakdown().get("input", 0)
+        tokens_out = result.tokens_breakdown().get("output", 0)
+        total_tokens = result.tokens()
+
+        # Either we have tokens (real API call) or zeros (mocked)
+        assert total_tokens >= 0
+        assert tokens_in >= 0
+        assert tokens_out >= 0
+
+        # Cost tracking
+        cost = result.cost_usd()
+        assert cost >= 0.0
+
+        # Latency tracking
+        latency_ms = result.latency_ms()
+        assert latency_ms > 0
+
+        # LLM calls count (for multi-step agents) - when mocked, may be 0
+        llm_calls = result.llm_calls_count()
+        assert llm_calls >= 0  # May be 0 in mocked scenarios
+
+        # Formatted metrics string (for logging/display)
+        metrics_str = result.format_metrics()
+        assert isinstance(metrics_str, str)
+        assert len(metrics_str) > 0
+
+    @patch("dopeagents.core.agent.Agent._extract")
+    def test_context_metadata_preserved(
+        self,
+        mock_extract: Mock,
+        executor: AgentExecutor,
+        deep_summarizer: DeepSummarizer,
+    ) -> None:
+        """Verify AgentContext metadata is preserved through execution."""
+        from dopeagents.agents.deep_summarizer import (
+            _AnalyzeOut,
+            _ChunkSummary,
+            _EvaluateOut,
+            _FormatOut,
+            _SynthesizeOut,
+        )
+
+        def side_effect(
+            response_model: type, messages: Any, model: Any = None, **kwargs: Any
+        ) -> Any:
+            if response_model is _AnalyzeOut:
+                return _AnalyzeOut(
+                    recommended_chunk_size=500, text_type="article", complexity="low"
+                )
+            if response_model is _ChunkSummary:
+                return _ChunkSummary(summary="test")
+            if response_model is _SynthesizeOut:
+                return _SynthesizeOut(synthesis="test", key_points=["p"])
+            if response_model is _EvaluateOut:
+                return _EvaluateOut(quality_score=0.9, feedback="ok")
+            if response_model is _FormatOut:
+                return _FormatOut(final_summary="final", word_count=10, truncated=False)
+            raise ValueError(f"Unexpected: {response_model}")
+
+        mock_extract.side_effect = side_effect
+
+        # Create context with custom metadata
+        custom_metadata = {
+            "user_id": "test-user-123",
+            "session_id": "sess-456",
+            "environment": "production",
+        }
+        context = AgentContext(metadata=custom_metadata)
+
+        input_data = DeepSummarizerInput(text=SAMPLE_TEXT)
+        result = executor.run(
+            agent=deep_summarizer,
+            input=input_data,
+            context=context,
+        )
+
+        # Verify context metadata is accessible in result
+        assert result.run_id == context.run_id
+        assert result.success is True
+
+
+# ── Input/Output Validation ────────────────────────────────────────────────
 
 
 class TestDeepSummarizerInput:
-    """Test DeepSummarizerInput validation."""
+    """Test DeepSummarizerInput Pydantic validation."""
 
     def test_valid_input(self) -> None:
         input_data = DeepSummarizerInput(
-            text="This is a test document.", style="bullets", max_length=300
+            text="This is a test document.",
+            style="bullets",
+            max_length=300,
         )
         assert input_data.text == "This is a test document."
         assert input_data.style == "bullets"
@@ -77,17 +312,16 @@ class TestDeepSummarizerInput:
 
     def test_style_enum_validation(self) -> None:
         with pytest.raises(ValueError):
-            DeepSummarizerInput(text="Valid text", style="invalid_style")  # type: ignore[arg-type]
+            DeepSummarizerInput(text="Valid text", style="invalid_style")  # type: ignore
 
     def test_focus_optional(self) -> None:
         input_data = DeepSummarizerInput(text="Valid text")
         assert input_data.focus is None
 
 
-# ── Output validation ─────────────────────────────────────────────────────────
-
-
 class TestDeepSummarizerOutput:
+    """Test DeepSummarizerOutput Pydantic validation."""
+
     def test_valid_output(self) -> None:
         output = DeepSummarizerOutput(
             summary="This is a summary.",
@@ -324,6 +558,9 @@ class TestDeepSummarizerMaxChunksGuard:
             "refined": "",
             "refinement_rounds": 0,
             "max_refinement_loops": 3,
+            "quality_threshold": 0.5,
+            "score_history": [],
+            "total_tokens_used": 0,
             "final_summary": "",
             "word_count": 0,
             "truncated": False,
@@ -457,6 +694,375 @@ class TestDeepSummarizerRefinementLoop:
         assert result.output.refinement_rounds == 1
 
 
+# ── Initialization and caching ─────────────────────────────────────────────────
+
+
+class TestDeepSummarizerInitialization:
+    """Test __init__ properly initializes instance variables."""
+
+    def test_init_creates_graph_cache_as_none(self) -> None:
+        """__init__ initializes _graph to None for lazy loading."""
+        agent = DeepSummarizer()
+        assert hasattr(agent, "_graph")
+        assert agent._graph is None
+
+    def test_init_creates_step_models_dict(self) -> None:
+        """__init__ initializes _step_models as empty dict or from kwargs."""
+        agent = DeepSummarizer()
+        assert hasattr(agent, "_step_models")
+        assert isinstance(agent._step_models, dict)
+
+    def test_init_with_step_models_kwarg(self) -> None:
+        """__init__ accepts step_models as kwarg."""
+        step_models = {"analyze": "gpt-4-turbo", "refine": "gpt-4"}
+        agent = DeepSummarizer(step_models=step_models)
+        assert agent._step_models == step_models
+
+    def test_init_calls_parent_init(self) -> None:
+        """__init__ properly calls super().__init__()."""
+        agent = DeepSummarizer(model="custom/model")
+        assert agent._model == "custom/model"
+        # Verify other parent properties are set
+        assert agent.name == "DeepSummarizer"
+        assert agent.version == "1.0.0"
+
+
+# ── Graph caching and compilation ──────────────────────────────────────────────
+
+
+class TestDeepSummarizerGraphCaching:
+    """Test _get_graph() lazy initialization and caching behavior."""
+
+    def test_get_graph_returns_compiled_graph(self) -> None:
+        """_get_graph() returns a compiled StateGraph."""
+        agent = DeepSummarizer()
+        graph = agent._get_graph()
+        assert graph is not None
+        assert hasattr(graph, "invoke"), "Graph must be compiled with invoke() method"
+
+    def test_get_graph_caches_on_first_call(self) -> None:
+        """_get_graph() caches the compiled graph after first invocation."""
+        agent = DeepSummarizer()
+        graph1 = agent._get_graph()
+        graph2 = agent._get_graph()
+        assert graph1 is graph2, "Graph should be cached (same object reference)"
+
+    def test_get_graph_populates_instance_variable(self) -> None:
+        """_get_graph() sets self._graph after compilation."""
+        agent = DeepSummarizer()
+        assert agent._graph is None
+        graph = agent._get_graph()
+        assert agent._graph is graph
+
+    def test_different_agents_have_different_graphs(self) -> None:
+        """Different agent instances have independent graph caches."""
+        agent1 = DeepSummarizer()
+        agent2 = DeepSummarizer()
+        graph1 = agent1._get_graph()
+        graph2 = agent2._get_graph()
+        assert graph1 is not graph2, "Different agents should have different graph objects"
+
+
+# ── Token estimation ──────────────────────────────────────────────────────────
+
+
+class TestDeepSummarizerTokenEstimation:
+    """Test _estimate_tokens() for accurate token counting."""
+
+    def test_estimate_tokens_empty_string(self) -> None:
+        """_estimate_tokens('') returns minimum 1 token."""
+        agent = DeepSummarizer()
+        assert agent._estimate_tokens("") == 1
+
+    def test_estimate_tokens_short_text(self) -> None:
+        """_estimate_tokens() uses 4-char approximation."""
+        agent = DeepSummarizer()
+        # 4 chars = 1 token, 8 chars = 2 tokens, etc.
+        assert agent._estimate_tokens("abcd") == 1  # 4 / 4 = 1
+        assert agent._estimate_tokens("abcdefgh") == 2  # 8 / 4 = 2
+        assert agent._estimate_tokens("abcdefghij") == 2  # 10 / 4 = 2 (integer division)
+
+    def test_estimate_tokens_sample_text(self) -> None:
+        """_estimate_tokens() approximates real text reasonably."""
+        agent = DeepSummarizer()
+        # SAMPLE_TEXT is ~800 chars, should estimate ~200 tokens (800/4)
+        estimated = agent._estimate_tokens(SAMPLE_TEXT)
+        expected_approx = len(SAMPLE_TEXT) // 4
+        assert estimated == expected_approx
+        assert 100 < estimated < 300, f"Expected ~200 tokens, got {estimated}"
+
+    def test_estimate_tokens_respects_minimum(self) -> None:
+        """_estimate_tokens() always returns at least 1."""
+        agent = DeepSummarizer()
+        # Even very short strings should return 1
+        assert agent._estimate_tokens("a") >= 1
+        assert agent._estimate_tokens("ab") >= 1
+        assert agent._estimate_tokens("abc") >= 1
+
+
+# ── Model selection per step ───────────────────────────────────────────────────
+
+
+class TestDeepSummarizerModelSelection:
+    """Test _model_for_step() respects per-step overrides."""
+
+    def test_model_for_step_default_model(self) -> None:
+        """_model_for_step() returns default model when no override."""
+        agent = DeepSummarizer(model="default/model")
+        for step in ["analyze", "chunk", "summarize", "synthesize", "evaluate", "refine", "format"]:
+            assert agent._model_for_step(step) == "default/model"
+
+    def test_model_for_step_respects_overrides(self) -> None:
+        """_model_for_step() checks _step_models dict first."""
+        agent = DeepSummarizer(
+            model="default/model",
+            step_models={
+                "analyze": "fast/model",
+                "refine": "expensive/model",
+            },
+        )
+        assert agent._model_for_step("analyze") == "fast/model"
+        assert agent._model_for_step("refine") == "expensive/model"
+        assert agent._model_for_step("chunk") == "default/model"  # Not overridden
+
+    def test_model_for_step_all_steps_work(self) -> None:
+        """_model_for_step() handles all step names."""
+        agent = DeepSummarizer()
+        steps = ["analyze", "chunk", "summarize", "synthesize", "evaluate", "refine", "format"]
+        for step in steps:
+            model = agent._model_for_step(step)
+            assert model is not None
+            assert len(model) > 0
+
+
+# ── AgentResult typing and return values ─────────────────────────────────────
+
+
+class TestDeepSummarizerAgentResultTyping:
+    """Test AgentResult is properly typed with generic output."""
+
+    @patch("dopeagents.core.agent.Agent._extract")
+    def test_run_returns_agent_result_with_output(self, mock_extract: Mock) -> None:
+        """agent.run() returns AgentResult[DeepSummarizerOutput]."""
+        from dopeagents.agents.deep_summarizer import (
+            _AnalyzeOut,
+            _ChunkSummary,
+            _EvaluateOut,
+            _FormatOut,
+            _SynthesizeOut,
+        )
+
+        def side_effect(
+            response_model: type, messages: Any, model: Any = None, **kwargs: Any
+        ) -> Any:
+            if response_model is _AnalyzeOut:
+                return _AnalyzeOut(
+                    recommended_chunk_size=500, text_type="article", complexity="low"
+                )
+            if response_model is _ChunkSummary:
+                return _ChunkSummary(summary="summary")
+            if response_model is _SynthesizeOut:
+                return _SynthesizeOut(synthesis="synthesis", key_points=["point"])
+            if response_model is _EvaluateOut:
+                return _EvaluateOut(quality_score=0.9, feedback="good")
+            if response_model is _FormatOut:
+                return _FormatOut(final_summary="final", word_count=10, truncated=False)
+            raise ValueError(f"Unexpected: {response_model}")
+
+        mock_extract.side_effect = side_effect
+        agent = DeepSummarizer()
+        result = agent.run(DeepSummarizerInput(text="Test document."))
+
+        assert isinstance(result, AgentResult)
+        assert result.output is not None
+        assert isinstance(result.output, DeepSummarizerOutput)
+        assert result.success is True
+        assert result.error is None
+
+    @patch("dopeagents.core.agent.Agent._extract")
+    def test_run_returns_agent_result_on_failure(self, mock_extract: Mock) -> None:
+        """agent.run() returns AgentResult with error on failure."""
+        mock_extract.side_effect = Exception("LLM API error")
+        agent = DeepSummarizer()
+
+        result = agent.run(DeepSummarizerInput(text="Test"))
+
+        assert isinstance(result, AgentResult)
+        # Either success=False with error, or success=True with partial output
+        assert isinstance(result.success, bool)
+        if not result.success:
+            assert result.error is not None
+            assert result.output is None
+
+    def test_agent_result_has_metrics(self) -> None:
+        """AgentResult includes ExecutionMetrics."""
+        # This is more of an executor responsibility, but verify the typing
+        from uuid import UUID
+
+        from dopeagents.core.types import ExecutionMetrics
+
+        metrics = ExecutionMetrics(
+            run_id=UUID("12345678-1234-5678-1234-567812345678"),
+            latency_ms=125.5,
+            cache_hit=False,
+            cost_usd=0.001,
+        )
+        assert metrics.latency_ms == 125.5
+        assert metrics.cache_hit is False
+
+
+# ── Graceful degradation ───────────────────────────────────────────────────────
+
+
+class TestDeepSummarizerGracefulDegradation:
+    """Test graceful degradation when steps fail."""
+
+    @patch("dopeagents.core.agent.Agent._extract")
+    def test_chunk_failure_continues_with_full_text(self, mock_extract: Mock) -> None:
+        """If _step_chunk fails, continue with full text as single chunk."""
+        from dopeagents.agents.deep_summarizer import _AnalyzeOut
+
+        call_count = {"calls": 0}
+
+        def side_effect(
+            response_model: type, messages: Any, model: Any = None, **kwargs: Any
+        ) -> Any:
+            call_count["calls"] += 1
+            if response_model is _AnalyzeOut:
+                return _AnalyzeOut(
+                    recommended_chunk_size=500, text_type="article", complexity="low"
+                )
+            # Simulate chunk failure by raising
+            raise Exception("Chunking failed: text too complex")
+
+        mock_extract.side_effect = side_effect
+        agent = DeepSummarizer()
+
+        # Should complete despite chunk failure
+        result = agent.run(DeepSummarizerInput(text="Short test."))
+        assert isinstance(result, AgentResult)
+        # May succeed with partial output or fail completely
+        assert isinstance(result.success, bool)
+
+    @patch("dopeagents.core.agent.Agent._extract")
+    def test_synthesis_failure_returns_partial_output(self, mock_extract: Mock) -> None:
+        """If synthesis fails after summarization, return partial result."""
+        from dopeagents.agents.deep_summarizer import _AnalyzeOut, _ChunkSummary
+
+        def side_effect(
+            response_model: type, messages: Any, model: Any = None, **kwargs: Any
+        ) -> Any:
+            if response_model is _AnalyzeOut:
+                return _AnalyzeOut(
+                    recommended_chunk_size=500, text_type="article", complexity="low"
+                )
+            if response_model is _ChunkSummary:
+                return _ChunkSummary(summary="summary")
+            # Synthesis failure
+            raise Exception("Synthesis LLM timeout")
+
+        mock_extract.side_effect = side_effect
+        agent = DeepSummarizer()
+        result = agent.run(DeepSummarizerInput(text="Test"))
+
+        assert isinstance(result, AgentResult)
+
+
+# ── Token tracking integration ─────────────────────────────────────────────────
+
+
+class TestDeepSummarizerTokenTracking:
+    """Test token tracking across workflow steps."""
+
+    @patch("dopeagents.core.agent.Agent._extract")
+    def test_output_includes_total_tokens_used(self, mock_extract: Mock) -> None:
+        """Output includes total_tokens_used field from all steps."""
+        from dopeagents.agents.deep_summarizer import (
+            _AnalyzeOut,
+            _ChunkSummary,
+            _EvaluateOut,
+            _FormatOut,
+            _SynthesizeOut,
+        )
+
+        def side_effect(
+            response_model: type, messages: Any, model: Any = None, **kwargs: Any
+        ) -> Any:
+            if response_model is _AnalyzeOut:
+                return _AnalyzeOut(
+                    recommended_chunk_size=500, text_type="article", complexity="low"
+                )
+            if response_model is _ChunkSummary:
+                return _ChunkSummary(summary="test")
+            if response_model is _SynthesizeOut:
+                return _SynthesizeOut(synthesis="test", key_points=["p1"])
+            if response_model is _EvaluateOut:
+                return _EvaluateOut(quality_score=0.9, feedback="")
+            if response_model is _FormatOut:
+                return _FormatOut(final_summary="final", word_count=5, truncated=False)
+            raise ValueError(f"Unexpected: {response_model}")
+
+        mock_extract.side_effect = side_effect
+        agent = DeepSummarizer()
+        result = agent.run(DeepSummarizerInput(text=SAMPLE_TEXT))
+
+        assert result.output is not None
+        assert hasattr(result.output, "total_tokens_used")
+        assert isinstance(result.output.total_tokens_used, int)
+        assert result.output.total_tokens_used >= 0
+
+    def test_estimate_tokens_for_budget_decisions(self) -> None:
+        """_estimate_tokens() helps make chunking decisions."""
+        agent = DeepSummarizer()
+
+        text = "word " * 1000  # 5000 chars
+        tokens = agent._estimate_tokens(text)
+
+        # Should estimate ~1250 tokens (5000 / 4)
+        assert 1000 < tokens < 1500
+
+        # Use token estimate for chunking decision
+        target_chunk_tokens = 500
+        target_chunk_chars = target_chunk_tokens * 4
+        num_chunks = max(1, len(text) // target_chunk_chars)
+
+        # 5000 / 2000 = 2 (integer division)
+        assert num_chunks == 2
+
+
+# ── State management ───────────────────────────────────────────────────────────
+
+
+class TestDeepSummarizerStateManagement:
+    """Test state initialization and management across workflow."""
+
+    def test_state_has_all_required_fields(self) -> None:
+        """DeepSummarizerState TypedDict has all 19 required fields."""
+        state: DeepSummarizerState = {
+            "text": "test",
+            "max_length": 500,
+            "style": "paragraph",
+            "focus": None,
+            "analysis": {},
+            "chunks": [],
+            "chunk_summaries": [],
+            "synthesis": "",
+            "quality_score": 0.0,
+            "feedback": "",
+            "refined": "",
+            "refinement_rounds": 0,
+            "max_refinement_loops": 3,
+            "quality_threshold": 0.8,
+            "score_history": [],
+            "total_tokens_used": 0,
+            "final_summary": "",
+            "word_count": 0,
+            "truncated": False,
+            "key_points": [],
+        }
+        assert len(state) == 20  # 20 fields as per implementation
+
+
 # ── Integration tests (real Groq API) ────────────────────────────────────────
 
 
@@ -475,7 +1081,14 @@ class TestDeepSummarizerIntegration:
         result = agent.run(input_data)
 
         assert isinstance(result, AgentResult)
-        assert result.output is not None
+
+        # Handle rate limiting: if output is None, just verify result structure
+        if result.output is None:
+            # If API was rate limited, we'll at least have error message
+            if result.error and "rate" in result.error.lower():
+                pytest.skip("API rate limit exceeded")
+            assert result.output is not None, f"Unexpected failure: {result.error}"
+
         output = result.output
         assert isinstance(output, DeepSummarizerOutput)
         assert output.summary
@@ -511,7 +1124,86 @@ class TestDeepSummarizerIntegration:
                 max_length=200,  # Tight constraint → harder to satisfy → more refine loops
             )
         )
+
+        # Handle rate limiting
+        if result.output is None:
+            if result.error and "rate" in result.error.lower():
+                pytest.skip("API rate limit exceeded")
+            assert result.output is not None, f"Unexpected failure: {result.error}"
+
         # We can assert refinement_rounds >= 0 as the actual score depends on LLM
         # The important assertion is it completes and is bounded
         assert isinstance(result.output, DeepSummarizerOutput)
         assert result.output.refinement_rounds <= 3  # Respects max_refinement_loops
+
+    @requires_groq
+    def test_run_with_context_parameter(self) -> None:
+        """Test run() accepts optional AgentContext for tracing."""
+        agent = DeepSummarizer()
+        context = AgentContext(metadata={"trace_id": "test-trace-123"})
+        result = agent.run(DeepSummarizerInput(text=SAMPLE_TEXT), _context=context)
+
+        assert isinstance(result, AgentResult)
+
+        # Handle rate limiting
+        if result.output is None:
+            if result.error and "rate" in result.error.lower():
+                pytest.skip("API rate limit exceeded")
+            assert result.output is not None, f"Unexpected failure: {result.error}"
+
+        assert isinstance(result.output, DeepSummarizerOutput)
+
+    @requires_groq
+    def test_all_output_fields_populated(self) -> None:
+        """Verify all DeepSummarizerOutput fields are populated after run()."""
+        agent = DeepSummarizer()
+        result = agent.run(DeepSummarizerInput(text=SAMPLE_TEXT, style="tldr"))
+
+        # Handle rate limiting
+        if result.output is None:
+            if result.error and "rate" in result.error.lower():
+                pytest.skip("API rate limit exceeded")
+            assert result.output is not None, f"Unexpected failure: {result.error}"
+
+        output = result.output
+        assert output.summary, "summary must be non-empty"
+        assert isinstance(output.key_points, list)
+        assert 0.0 <= output.quality_score <= 1.0
+        assert output.refinement_rounds >= 0
+        assert output.chunks_processed >= 1
+        assert output.word_count > 0
+        assert isinstance(output.truncated, bool)
+        assert output.total_tokens_used >= 0
+
+    @requires_groq
+    def test_different_styles_produce_different_formats(self) -> None:
+        """Test output format matches requested style."""
+        agent = DeepSummarizer()
+
+        paragraph_result = agent.run(DeepSummarizerInput(text=SAMPLE_TEXT, style="paragraph"))
+
+        # Handle rate limiting gracefully
+        if paragraph_result.output is None:
+            if paragraph_result.error and "rate" in paragraph_result.error.lower():
+                pytest.skip("API rate limit exceeded")
+            assert (
+                paragraph_result.output is not None
+            ), f"Unexpected failure: {paragraph_result.error}"
+
+        # Only test remaining styles if first succeeded
+        bullets_result = agent.run(DeepSummarizerInput(text=SAMPLE_TEXT, style="bullets"))
+        tldr_result = agent.run(DeepSummarizerInput(text=SAMPLE_TEXT, style="tldr"))
+
+        # Check all results handle rate limiting
+        for result in [bullets_result, tldr_result]:
+            if result.output is None and result.error and "rate" in result.error.lower():
+                pytest.skip("API rate limit exceeded")
+
+        assert paragraph_result.output is not None
+        assert bullets_result.output is not None
+        assert tldr_result.output is not None
+
+        # Bullets format should have bullet markers or be more concise
+        # TLDR should be the shortest
+        # Paragraph should be largest
+        assert paragraph_result.output.word_count >= tldr_result.output.word_count

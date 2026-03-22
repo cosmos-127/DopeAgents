@@ -169,7 +169,7 @@ logger.info("Processing request", extra={"request_id": "abc123"})
 
 ### Prerequisites
 
-- Python 3.11+
+- Python 3.12+
 - [uv](https://github.com/astral-sh/uv) (recommended) or pip
 
 ### Installation for Development
@@ -179,14 +179,28 @@ logger.info("Processing request", extra={"request_id": "abc123"})
 git clone https://github.com/yourusername/DopeAgents.git
 cd DopeAgents
 
-# Install with uv
-uv sync
+# Install with uv (recommended - includes all optional dependencies)
+uv sync --all-extras
 
-# Or with pip + venv
+# Or with pip + venv (minimal dev setup)
 python -m venv .venv
 source .venv/bin/activate  # or `.venv\Scripts\activate` on Windows
 pip install -e ".[dev]"
 ```
+
+### Setting Up Pre-commit Hooks
+
+Pre-commit hooks automatically run type checking, linting, and formatting before every commit:
+
+```bash
+# Install Git hooks (one-time setup)
+pre-commit install
+
+# (Optional) Run all checks on all files to verify setup
+pre-commit run --all-files
+```
+
+Now mypy, black, isort, and ruff will run automatically before each commit. To skip (not recommended): `git commit --no-verify`
 
 ### Running Tests
 
@@ -215,6 +229,9 @@ ruff check dopeagents
 
 # Format
 ruff format dopeagents
+
+# Import sorting
+isort dopeagents
 ```
 
 ## Optional Dependencies

@@ -2,30 +2,22 @@
 
 from __future__ import annotations
 
-import os
+import threading
 from abc import ABC, abstractmethod
-from typing import (
-    TypeVar,
-    Generic,
-    ClassVar,
-    Any,
-    Optional,
-    Type,
-    get_args,
-    get_origin,
-    Callable,
-    cast,
-)
+from collections.abc import Callable
+from typing import Any, ClassVar, Generic, TypeVar, cast, get_args, get_origin
+
 from pydantic import BaseModel, Field
 
+from dopeagents.config import get_config
 from dopeagents.core.context import AgentContext
 from dopeagents.core.metadata import AgentMetadata
 from dopeagents.core.types import AgentResult
-from dopeagents.errors import TypeResolutionError, FrameworkNotInstalledError
 
 # Load .env if present (python-dotenv is a declared dependency)
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
@@ -36,15 +28,13 @@ OutputT = TypeVar("OutputT", bound=BaseModel)
 
 class DebugInfo(BaseModel):
     """Complete transparency into what an agent will do with a given input.
-    
+
     Returned by agent.debug(input) without making any LLM calls.
     Contains the graph structure, step prompts, and response schemas.
     """
 
-    is_multi_step: bool = Field(
-        default=False, description="Whether this agent has multiple steps"
-    )
-    graph_topology: Optional[dict[str, Any]] = Field(
+    is_multi_step: bool = Field(default=False, description="Whether this agent has multiple steps")
+    graph_topology: dict[str, Any] | None = Field(
         default=None,
         description="Step names and edges (for multi-step agents)",
     )
@@ -66,36 +56,30 @@ class DebugInfo(BaseModel):
 
 class AgentDescription(BaseModel):
     """Structured description of an agent — its steps, loop structure, and model assignments.
-    
+
     Returned by agent.describe() and used in discovery/composition.
     """
 
     name: str
     version: str
     description: str
-    is_multi_step: bool = Field(
-        default=False, description="Whether this agent has multiple steps"
-    )
-    steps: list[str] = Field(
-        default_factory=list, description="List of step names in order"
-    )
-    has_loops: bool = Field(
-        default=False, description="Whether this agent has refinement loops"
-    )
+    is_multi_step: bool = Field(default=False, description="Whether this agent has multiple steps")
+    steps: list[str] = Field(default_factory=list, description="List of step names in order")
+    has_loops: bool = Field(default=False, description="Whether this agent has refinement loops")
     capabilities: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     requires_llm: bool = Field(default=True)
-    default_model: Optional[str] = None
+    default_model: str | None = None
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] = Field(default_factory=dict)
 
 
 class Agent(ABC, Generic[InputT, OutputT]):
     """Base class for all DopeAgents.
-    
+
     Agents are generic over InputT and OutputT (Pydantic models).
     Concrete agents specialize this base class with specific input/output types.
-    
+
     Design principle: Agents contain ONLY workflow logic. Infrastructure concerns
     (cost tracking, observability, retry) are handled by the Lifecycle Layer.
     """
@@ -108,18 +92,18 @@ class Agent(ABC, Generic[InputT, OutputT]):
     capabilities: ClassVar[list[str]] = []
     tags: ClassVar[list[str]] = []
     requires_llm: ClassVar[bool] = True
-    default_model: ClassVar[Optional[str]] = None
+    default_model: ClassVar[str | None] = None
     system_prompt: ClassVar[str] = ""
     step_prompts: ClassVar[dict[str, str]] = {}
 
     def __init__(
         self,
-        model: Optional[str] = None,
-        step_models: Optional[dict[str, str]] = None,
-        **kwargs: Any
+        model: str | None = None,
+        step_models: dict[str, str] | None = None,
+        **kwargs: Any,
     ) -> None:
         """Initialize agent instance.
-        
+
         Args:
             model: Model to use for all steps (can be overridden by step_models)
             step_models: Per-step model overrides
@@ -127,106 +111,124 @@ class Agent(ABC, Generic[InputT, OutputT]):
         # Note: system_prompt is a ClassVar, so we don't override it at instance level
         # Remove this kwarg if passed to avoid unexpected behavior
         kwargs.pop("system_prompt", None)
-        
+
         # Store instance-level model configuration
-        # Prefer groq when key is present, fall back to openai model otherwise
-        import os
-        default_fallback = (
-            "groq/llama-3.1-8b-instant"
-            if os.environ.get("GROQ_API_KEY")
-            else "openai/gpt-4o-mini"
-        )
-        self._model = model or self.default_model or default_fallback
+        # Priority: explicit model > class default > config.resolve_model() (auto-detects from API key)
+        config = get_config()
+        self._model = model or self.default_model or config.resolve_model()
         self._step_models = step_models or {}
-        
+
         # Initialize cached graph (lazy-built by _get_graph)
         self._graph = None
+        # Thread-safe client initialization
+        self._client_lock = threading.Lock()
 
     # ── Type introspection (for accessing InputT and OutputT) ───────
 
     @classmethod
-    def input_type(cls) -> Type[InputT]:
+    def input_type(cls) -> type[InputT]:
         """Return the InputT type for this agent.
-        
+
         Resolves generics via __orig_bases__ introspection.
         """
         return cls._resolve_type("input")
 
     @classmethod
-    def output_type(cls) -> Type[OutputT]:
+    def output_type(cls) -> type[OutputT]:
         """Return the OutputT type for this agent.
-        
+
         Resolves generics via __orig_bases__ introspection.
         """
         return cls._resolve_type("output")
 
     @classmethod
-    def _resolve_type(cls, position: str) -> Type[Any]:
+    def _resolve_type(cls, position: str) -> type[Any]:
         """Resolve InputT (position=0) or OutputT (position=1) from __orig_bases__."""
         idx = 0 if position == "input" else 1
 
         # Walk the MRO to find the Agent specialization
         if not hasattr(cls, "__orig_bases__"):
-            raise ValueError(
-                f"Agent {cls.__name__} has no __orig_bases__"
-            )
-        
+            raise ValueError(f"Agent {cls.__name__} has no __orig_bases__")
+
         for base in cls.__orig_bases__:
             if get_origin(base) is Agent or (
-                hasattr(base, "__origin__")
-                and get_origin(base).__name__ == "Agent"
+                hasattr(base, "__origin__") and get_origin(base).__name__ == "Agent"
             ):
                 args = get_args(base)
                 if len(args) > idx:
-                    return cast(Type[Any], args[idx])
+                    return cast(type[Any], args[idx])
 
-        raise ValueError(
-            f"Could not resolve {position}_type for {cls.__name__}"
-        )
+        raise ValueError(f"Could not resolve {position}_type for {cls.__name__}")
 
     # ── Extraction primitive (the ONLY place agents call LLMs) ───────
 
+    def _get_client(self, model: str | None = None) -> Any:
+        """Get or create a cached Instructor client for the given model.
+
+        The executor attaches observability hooks to this client so token/cost
+        data is captured without any code inside the agent's run() method.
+
+        Args:
+            model: Model string (e.g. "groq/llama-3.1-8b-instant"). Defaults to
+                   self._model.  Mode (TOOLS vs MD_JSON) is determined per model.
+
+        Returns:
+            An instructor-patched LiteLLM client.
+        """
+        import instructor
+        import litellm
+
+        resolved_model = model or self._model
+        mode = (
+            instructor.Mode.MD_JSON if "groq" in resolved_model.lower() else instructor.Mode.TOOLS
+        )
+
+        # Cache key is the mode (not the exact model, since mode drives schema format)
+        cache_attr = f"_instructor_client_{mode.name}"
+
+        if not hasattr(self, cache_attr):
+            with self._client_lock:
+                if not hasattr(self, cache_attr):
+                    client = instructor.from_litellm(litellm.completion, mode=mode)
+                    object.__setattr__(self, cache_attr, client)
+
+        return getattr(self, cache_attr)
+
     def _extract(
         self,
-        response_model: Type[BaseModel],
+        response_model: type[BaseModel],
         messages: list[dict[str, str]],
-        model: Optional[str] = None,
+        model: str | None = None,
         **kwargs: Any,
     ) -> BaseModel:
         """Extract structured output from an LLM.
-        
+
         This is the ONLY method agents call to interact with LLMs.
         All validation, routing, cost tracking, and retry happen here.
-        
+
         Args:
             response_model: Pydantic model for validation
             messages: List of {"role", "content"} dicts
             model: Override model for this call (falls back to self.default_model)
             **kwargs: Additional args for Instructor/LiteLLM
-            
+
         Returns:
             Instance of response_model with validated output
-            
+
         Raises:
             ExtractionValidationError: Schema validation failed
             ExtractionProviderError: Provider error (rate limit, etc.)
         """
         import re
         import time
-        import instructor
-        import litellm
+
         from dopeagents.errors import ExtractionProviderError
 
         # Determine model: explicit arg > instance default
         resolved_model = model or self._model
 
-        # Groq requires JSON mode (tool_call mode has array schema issues)
-        if "groq" in resolved_model.lower():
-            mode = instructor.Mode.MD_JSON
-        else:
-            mode = instructor.Mode.TOOLS
-
-        litellm_client = instructor.from_litellm(litellm.completion, mode=mode)
+        # Use cached client (executor may have attached observability hooks)
+        litellm_client = self._get_client(resolved_model)
 
         # Pacing delay for groq free-tier TPM limits (~2 calls/sec)
         if "groq" in resolved_model.lower():
@@ -247,7 +249,7 @@ class Agent(ABC, Generic[InputT, OutputT]):
                     raise
 
                 # Parse retry-after from error message (e.g. "try again in 5m51s")
-                retry_after: Optional[int] = None
+                retry_after: int | None = None
                 m = re.search(r"try again in (\d+)m([\d.]+)s", str(exc))
                 if m:
                     retry_after = int(m.group(1)) * 60 + int(float(m.group(2)))
@@ -268,7 +270,7 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
                 # Short TPM rate limit — exponential backoff (max 3 retries)
                 if attempt < 3:
-                    wait = 2 ** attempt  # 1, 2, 4 seconds
+                    wait = 2**attempt  # 1, 2, 4 seconds
                     time.sleep(wait)
                     continue
 
@@ -283,13 +285,13 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
     def _extract_partial(
         self,
-        response_model: Type[BaseModel],
+        response_model: type[BaseModel],
         messages: list[dict[str, str]],
-        model: Optional[str] = None,
+        model: str | None = None,
         **kwargs: Any,
     ) -> BaseModel:
         """Extract partial structured output (streaming).
-        
+
         Used for LLMs that support incremental completion.
         Same semantics as _extract() but returns as streaming chunks.
         """
@@ -300,16 +302,16 @@ class Agent(ABC, Generic[InputT, OutputT]):
     # ── Public interface ──────────────────────────────────────────
 
     @abstractmethod
-    def run(self, input_data: InputT, context: Optional[AgentContext] = None) -> AgentResult[OutputT]:
+    def run(self, input_data: InputT, context: AgentContext | None = None) -> AgentResult[OutputT]:
         """Run the agent on input and return structured output.
-        
+
         Args:
             input_data: Instance of InputT (validated at compile time)
             context: Optional execution context with run ID and metadata
-            
+
         Returns:
             AgentResult[OutputT] with output and execution metadata
-            
+
         Raises:
             ExtractionError: LLM extraction failed
             GraphExecutionError: Internal graph execution failed
@@ -319,7 +321,7 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
     def describe(self) -> AgentDescription:
         """Return structured description of this agent.
-        
+
         Used for discovery, composition validation, and MCP schema generation.
         Does NOT execute the agent.
         """
@@ -339,9 +341,9 @@ class Agent(ABC, Generic[InputT, OutputT]):
             output_schema=self.output_type().model_json_schema(),
         )
 
-    def debug(self, input_data: InputT) -> DebugInfo:
+    def debug(self, input_data: InputT) -> DebugInfo:  # noqa: ARG002
         """Return complete debug info without executing the agent.
-        
+
         Shows graph structure, prompts, and schemas that would be used
         if run() were called with this input. No LLM calls, no cost.
         """
@@ -355,7 +357,7 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
     def metadata(self) -> AgentMetadata:
         """Return structured metadata about this agent.
-        
+
         Used by registry, composition checker, and MCP exposure.
         """
         return AgentMetadata(
@@ -376,11 +378,12 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
     def as_callable(self) -> Callable[[InputT], OutputT]:
         """Wrap agent as a plain Python callable.
-        
+
         Usage:
             fn = agent.as_callable()
             result = fn(input_data)
         """
+
         def wrapper(input_data: InputT) -> OutputT:
             result = self.run(input_data)
             if result.error:
@@ -393,23 +396,19 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
     def as_langchain_runnable(self) -> Any:
         """Wrap agent as a LangChain Runnable.
-        
+
         Requires: pip install dopeagents[langchain]
         """
         try:
-            from dopeagents.adapters.langchain_adapter import (
-                agent_to_langchain_runnable,
-            )
+            from dopeagents.adapters.langchain_adapter import agent_to_langchain_runnable
 
             return agent_to_langchain_runnable(self)
         except ImportError as e:
-            raise ImportError(
-                "LangChain adapter requires: pip install langchain-core"
-            ) from e
+            raise ImportError("LangChain adapter requires: pip install langchain-core") from e
 
     def as_langgraph_node(self) -> Any:
         """Wrap agent as a LangGraph node.
-        
+
         Requires: pip install langgraph (already core dep)
         """
         try:
@@ -417,13 +416,11 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
             return agent_to_langgraph_node(self)
         except ImportError as e:
-            raise ImportError(
-                "LangGraph adapter requires: pip install langgraph"
-            ) from e
+            raise ImportError("LangGraph adapter requires: pip install langgraph") from e
 
     def as_crewai_tool(self) -> Any:
         """Wrap agent as a CrewAI tool.
-        
+
         Requires: pip install dopeagents[crewai]
         """
         try:
@@ -431,13 +428,11 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
             return agent_to_crewai_tool(self)
         except ImportError as e:
-            raise ImportError(
-                "CrewAI adapter requires: pip install crewai"
-            ) from e
+            raise ImportError("CrewAI adapter requires: pip install crewai") from e
 
     def as_autogen_function(self) -> Any:
         """Wrap agent as an AutoGen function.
-        
+
         Requires: pip install dopeagents[autogen]
         """
         try:
@@ -445,13 +440,11 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
             return agent_to_autogen_function(self)
         except ImportError as e:
-            raise ImportError(
-                "AutoGen adapter requires: pip install autogen-agentchat"
-            ) from e
+            raise ImportError("AutoGen adapter requires: pip install autogen-agentchat") from e
 
     def as_openai_function(self) -> dict[str, Any]:
         """Wrap agent as an OpenAI function definition.
-        
+
         Returns a dict compatible with OpenAI's functions API.
         """
         input_schema = self.input_type().model_json_schema()
@@ -461,12 +454,12 @@ class Agent(ABC, Generic[InputT, OutputT]):
             "parameters": input_schema,
         }
 
-    def as_mcp_tool(self, server: Optional[Any] = None) -> Any:
+    def as_mcp_tool(self, server: Any | None = None) -> Any:
         """Register agent as MCP tool on a FastMCP server.
-        
+
         Args:
             server: FastMCP server instance. If None, creates a new one.
-            
+
         Returns:
             The MCP tool registration (or server if created).
         """
@@ -475,13 +468,11 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
             return register_agent_as_mcp_tool(self, server)
         except ImportError as e:
-            raise ImportError(
-                "MCP support requires: pip install dopeagents[mcp]"
-            ) from e
+            raise ImportError("MCP support requires: pip install dopeagents[mcp]") from e
 
     def as_mcp_server(self) -> Any:
         """Create a standalone MCP server exposing this agent as a tool.
-        
+
         Returns a FastMCP server ready to run.
         """
         try:
@@ -489,22 +480,20 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
             return create_single_agent_mcp_server(self)
         except ImportError as e:
-            raise ImportError(
-                "MCP support requires: pip install dopeagents[mcp]"
-            ) from e
+            raise ImportError("MCP support requires: pip install dopeagents[mcp]") from e
 
     # ── Introspection helpers ──────────────────────────────────────
 
     def _has_loops(self) -> bool:
         """Whether this agent has internal refinement loops.
-        
+
         Override in subclasses that have conditional edges.
         """
         return False
 
     def _build_graph(self) -> Any:
         """Build the internal LangGraph (for multi-step agents).
-        
+
         Override in subclasses that use LangGraph.
         Single-step agents return None.
         """
@@ -512,10 +501,10 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
     def _get_graph(self) -> Any:
         """Lazily build and cache the internal LangGraph.
-        
+
         Multi-step agents implement _build_graph() to return a compiled graph.
         Single-step agents don't override this — _get_graph() returns None.
-        
+
         The compiled graph is a private implementation detail — callers use run().
         """
         if self._graph is None and hasattr(self, "_build_graph"):
@@ -524,14 +513,13 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
     def _model_for_step(self, step_name: str) -> str:
         """Returns the model to use for a given step.
-        
+
         Respects step-level overrides via _step_models, falling back to _model.
-        
+
         Args:
             step_name: Name of the step (e.g., "analyze", "summarize")
-        
+
         Returns:
             Model name to use for this step
         """
         return self._step_models.get(step_name, self._model)
-

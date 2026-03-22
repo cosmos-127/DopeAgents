@@ -7,7 +7,7 @@ Provides a logger factory with environment-aware color support:
 
 Usage:
     from dopeagents.observability.logging import get_logger
-    
+
     logger = get_logger(__name__)
     logger.info("Starting agent workflow")
     logger.debug("Detailed diagnostic info", extra={"workflow_id": "abc"})
@@ -91,7 +91,7 @@ def get_logger(name: str) -> logging.Logger:
 
 def reset_logging() -> None:
     """Reset all cached loggers and config.
-    
+
     Useful for testing or when reconfiguring DopeAgentsConfig.
     Clears both the logger cache and the global config singleton.
     """

@@ -1,8 +1,17 @@
-"""DeepSummarizer agent: multi-step document summarization with self-evaluation and refinement."""
+"""DeepSummarizer agent: multi-step document summarization with self-evaluation and refinement.
+
+This agent serves as a reference implementation for Phase 2 infrastructure:
+- Lifecycle management (AgentExecutor)
+- Cost tracking and budget guards
+- Caching and memoization
+- Resilience (retry, fallback, degradation)
+- Observability and tracing
+"""
 
 from __future__ import annotations
 
 import re
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, ClassVar, Literal, TypedDict, cast
 
@@ -12,7 +21,6 @@ from pydantic import BaseModel, Field
 from dopeagents.core.agent import Agent
 from dopeagents.core.context import AgentContext
 from dopeagents.core.types import AgentResult
-
 
 # ── Internal State ─────────────────────────────────────────────────────────
 
@@ -194,7 +202,6 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
     capabilities: ClassVar[list[str]] = ["summarization", "text-analysis", "refinement"]
     tags: ClassVar[list[str]] = ["text", "llm-based", "multi-step"]
     requires_llm: ClassVar[bool] = True
-    default_model: ClassVar[str] = "groq/openai/gpt-oss-20b"
 
     system_prompt: ClassVar[str] = (
         "You are an expert document summarization agent. Your task is to produce "
@@ -252,8 +259,79 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
         ),
     }
 
+    def __init__(self, **kwargs: Any) -> None:
+        """Initialize DeepSummarizer with caching and per-step model overrides.
+
+        Args:
+            **kwargs: Passed to parent Agent.__init__ (model, hooks, cache, etc.) plus step_prompts
+        """
+        # Extract and apply custom step_prompts if provided
+        custom_step_prompts = kwargs.pop("step_prompts", None)
+
+        super().__init__(**kwargs)
+
+        # Apply custom step_prompts if provided (shadows ClassVar)
+        if custom_step_prompts is not None:
+            self.step_prompts = {**self.step_prompts, **custom_step_prompts}  # type: ignore[misc]
+
+        # Lazy-initialized LangGraph StateGraph
+        self._graph: Any | None = None
+        # Per-step model overrides (empty dict by default)
+        self._step_models: dict[str, str] = getattr(self, "_step_models", {})
+
+    def _model_for_step(self, step_name: str) -> str:
+        """Get the model for a specific step, respecting per-step overrides.
+
+        Args:
+            step_name: Name of the step (analyze, chunk, summarize, etc.)
+
+        Returns:
+            Model string to use for this step
+        """
+        return self._step_models.get(step_name, self._model)
+
+    def _get_graph(self) -> Any:
+        """Get or lazily build the compiled LangGraph state machine.
+
+        Caches the compiled graph in self._graph to avoid rebuilding on each run.
+        This is important for performance in multi-invocation scenarios.
+
+        Returns:
+            Compiled StateGraph ready for invocation
+        """
+        if self._graph is None:
+            self._graph = self._build_graph()
+        return self._graph
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count from text using character approximation.
+
+        Rough heuristic: 4 characters ≈ 1 token (standard for GPT models).
+        This is used for token budget decisions and LLM provider estimation.
+
+        Args:
+            text: Text to estimate tokens for
+
+        Returns:
+            Estimated token count (minimum 1)
+        """
+        return max(1, len(text) // 4)
+
     def _build_graph(self) -> Any:
-        """Build the internal LangGraph StateGraph for the 7-step workflow."""
+        """Build the internal LangGraph StateGraph for the 7-step workflow.
+
+        Constructs the complete summarization pipeline:
+          1. analyze    → text analysis and chunking strategy
+          2. chunk      → text splitting with overlap
+          3. summarize  → parallel chunk summarization
+          4. synthesize → combine summaries coherently
+          5. evaluate   → score quality and identify weaknesses
+          6. refine     → improve based on feedback (loops)
+          7. format     → apply style and finalize metrics
+
+        Returns:
+            Compiled and ready-to-invoke StateGraph
+        """
         graph = StateGraph(DeepSummarizerState)
 
         # Add all step nodes
@@ -305,6 +383,12 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
 
         LiteLLM responses include usage info when using OpenAI-compatible clients.
         Falls back to 0 if metadata unavailable.
+
+        Args:
+            response: LiteLLM response object with optional usage metadata
+
+        Returns:
+            Total tokens used (prompt + completion), or 0 if unavailable
         """
         try:
             # LiteLLM embeds usage info in response object
@@ -340,6 +424,14 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
 
         This is especially valuable for multi-step pipelines where understanding
         cumulative cost and token budget is critical for chunking decisions.
+
+        Args:
+            response_model: Pydantic model to extract into
+            messages: List of message dicts with 'role' and 'content'
+            model: Model identifier string
+
+        Returns:
+            Tuple of (extracted_output, estimated_tokens_used)
         """
         # Note: The parent _extract() method doesn't expose raw response.
         # In a production setup, you'd want to hook into the provider's
@@ -357,6 +449,13 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
         """Split text into sentences using regex that respects sentence boundaries.
 
         Handles common abbreviations and capital letters to avoid false splits.
+        Uses pattern: (period/exclamation/question mark) + space + capital letter.
+
+        Args:
+            text: Raw text to split into sentences
+
+        Returns:
+            List of sentence strings (stripped of whitespace)
         """
         # Split on sentence-ending punctuation followed by space and capital letter
         # This avoids splitting on abbreviations like "Dr." or decimal points
@@ -366,7 +465,19 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
     # -- Step Methods ───────────────────────────────────────────────────────────
 
     def _step_analyze(self, state: DeepSummarizerState) -> dict[str, Any]:
-        """Analyze text structure and recommend chunking strategy, tracking token usage."""
+        """Analyze text structure and recommend chunking strategy.
+
+        Examines the input text to determine:
+        - Optimal chunk size based on structure
+        - Text type classification (article, research, story, etc.)
+        - Complexity level (simple, medium, complex)
+
+        Args:
+            state: Current LangGraph state
+
+        Returns:
+            State dict with 'analysis' key containing recommendations
+        """
         out = cast(
             _AnalyzeOut,
             self._extract(
@@ -390,10 +501,19 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
         }
 
     def _step_chunk(self, state: DeepSummarizerState) -> dict[str, Any]:
-        """Split text into chunks using paragraph boundaries with overlap and sentence awareness.
+        """Split text into chunks using paragraph boundaries with overlap.
 
-        Chunks are sized based on character counts as a proxy for tokens.
-        For token-aware chunking, could integrate the LLM provider's tokenizer.
+        Strategy:
+        1. Split on paragraph boundaries (\\n\\n)
+        2. Fall back to sentence splitting if no paragraphs
+        3. Merge into target-sized chunks with 15% overlap
+        4. Guard against > 10 chunks (cost/latency protection)
+
+        Args:
+            state: Current LangGraph state
+
+        Returns:
+            State dict with 'chunks' list
         """
         text = state["text"]
         target_size = state["analysis"].get("recommended_chunk_size", 512)
@@ -430,10 +550,8 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
         if not chunks:
             chunks = [text]
 
-        # Guard: max 10 chunks
+        # Guard: max 10 chunks (cost and latency protection)
         if len(chunks) > 10:
-            import warnings
-
             warnings.warn(
                 f"Chunk count {len(chunks)} exceeds max_chunks=10. Truncating.",
                 ResourceWarning,
@@ -444,7 +562,17 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
         return {"chunks": chunks}
 
     def _step_summarize(self, state: DeepSummarizerState) -> dict[str, Any]:
-        """Summarize each chunk independently, parallelized when beneficial."""
+        """Summarize each chunk independently, parallelized for multi-chunk efficiency.
+
+        Single chunk: sequential (overhead not justified)
+        Multiple chunks: parallel with max 4 workers (rate limit safety)
+
+        Args:
+            state: Current LangGraph state with 'chunks' list
+
+        Returns:
+            State dict with 'chunk_summaries' list
+        """
         chunks = state["chunks"]
 
         if len(chunks) == 1:
@@ -488,7 +616,18 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
         return {"chunk_summaries": summaries}
 
     def _step_synthesize(self, state: DeepSummarizerState) -> dict[str, Any]:
-        """Combine chunk summaries into a coherent whole."""
+        """Combine chunk summaries into a coherent narrative.
+
+        Merges overlapping summaries and elimates duplicates.
+        Respects focus area if provided.
+        Extracts 3-5 key points.
+
+        Args:
+            state: Current LangGraph state with 'chunk_summaries'
+
+        Returns:
+            State dict with 'synthesis' and 'key_points'
+        """
         summaries_text = "\n".join(state["chunk_summaries"])
         focus = state.get("focus")
         focus_instruction = (
@@ -508,7 +647,22 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
         return {"synthesis": out.synthesis, "key_points": out.key_points}
 
     def _step_evaluate(self, state: DeepSummarizerState) -> dict[str, Any]:
-        """Score the synthesis against the original text and identify weaknesses."""
+        """Score the synthesis on three independent criteria.
+
+        Criteria:
+        - Faithfulness: are all claims grounded in source?
+        - Completeness: are all key points covered?
+        - Coherence: is it well-structured and readable?
+
+        Penalizes hallucinations and identifies weakest criterion for
+        targeted refinement feedback.
+
+        Args:
+            state: Current LangGraph state
+
+        Returns:
+            State dict with quality_score, feedback, and score_history
+        """
         current_synthesis = state.get("refined") or state["synthesis"]
         source_excerpt = state["text"][:4000]
         focus = state.get("focus")
@@ -570,7 +724,17 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
         }
 
     def _step_refine(self, state: DeepSummarizerState) -> dict[str, Any]:
-        """Improve synthesis using feedback, grounded in the original text."""
+        """Improve synthesis using targeted feedback from evaluation.
+
+        Provides original text for grounding to prevent hallucinations.
+        Updates both 'refined' and 'synthesis' to ensure next evaluate reads refined version.
+
+        Args:
+            state: Current LangGraph state
+
+        Returns:
+            State dict with updated 'refined', 'synthesis', and refinement_rounds
+        """
         current_synthesis = state.get("refined") or state["synthesis"]
         feedback = state["feedback"]
         source_excerpt = state["text"][:4000]
@@ -603,7 +767,18 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
         }
 
     def _step_format(self, state: DeepSummarizerState) -> dict[str, Any]:
-        """Apply style constraints and compute final metrics."""
+        """Apply style constraints and compute final output metrics.
+
+        Converts synthesis to requested format: paragraph, bullets, or TLDR.
+        Enforces max_length by truncating if necessary.
+        Respects focus area emphasis if provided.
+
+        Args:
+            state: Current LangGraph state
+
+        Returns:
+            State dict with final_summary, word_count, and truncated flag
+        """
         current_synthesis = state.get("refined") or state["synthesis"]
         style = state["style"]
         max_length = state["max_length"]
@@ -649,7 +824,25 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
     def run(
         self, input: DeepSummarizerInput, _context: AgentContext | None = None
     ) -> AgentResult[DeepSummarizerOutput]:
-        """Execute the 7-step DeepSummarizer workflow with graceful degradation on failure."""
+        """Execute the 7-step DeepSummarizer workflow with graceful degradation.
+
+        Main entry point called by AgentExecutor with full lifecycle integration:
+        - Cost tracking (per-step token counting)
+        - Caching of intermediate results
+        - Resilience (retry policy, fallback chain, budget guards handled by executor)
+        - Observability (spans, metrics, tracing via executor)
+
+        Graceful degradation: if any step fails, returns best partial synthesis
+        produced so far with success=True and error message.
+        Complete failure only if no synthesis available at any point.
+
+        Args:
+            input: DeepSummarizerInput with text, max_length, style, focus
+            _context: Optional AgentContext (managed by executor)
+
+        Returns:
+            AgentResult[DeepSummarizerOutput] with summary, quality_score, metrics
+        """
         graph = self._get_graph()
 
         # Build initial state
@@ -715,7 +908,7 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
             cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
             if cause is not None:
                 error_msg = str(cause)
-            return AgentResult(output=None, success=False, error=error_msg)
+            return AgentResult[DeepSummarizerOutput](output=None, success=False, error=error_msg)
 
         # Normal completion: map to public output
         output = DeepSummarizerOutput(
@@ -732,7 +925,17 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
         return AgentResult(output=output)
 
     def _render_prompt(self, _input: DeepSummarizerInput) -> str | None:
-        """Return a readable overview of the step prompts for debugging."""
+        """Return readable overview of all step prompts for debugging and introspection.
+
+        Used by agent.debug(input) to show what prompts will be used.
+        Useful for prompt engineering and understanding agent behavior.
+
+        Args:
+            _input: Agent input (unused, but part of interface)
+
+        Returns:
+            Formatted string with all step prompts
+        """
         lines = ["DeepSummarizer 7-Step Workflow Prompts:\n"]
         for step_name, prompt in self.step_prompts.items():
             lines.append(f"\n--- {step_name.upper()} ---")
@@ -740,7 +943,14 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
         return "\n".join(lines)
 
     def _get_model_config(self) -> dict[str, Any] | None:
-        """Return model configuration for debugging."""
+        """Return model configuration for debugging and introspection.
+
+        Shows which models are used for each step and key limits.
+        Used by agent.describe() and observability tooling.
+
+        Returns:
+            Dict with default_model, step_models, and key hyperparameters
+        """
         return {
             "default_model": self._model,
             "step_models": self._step_models,
