@@ -79,6 +79,12 @@ class AgentExecutor:
         from dopeagents.cost.guard import BudgetGuard
 
         context = context or AgentContext()
+        # Inject infrastructure references into context for agent-level cooperation
+        # (e.g., per-step tracing, budget-aware refinement loops)
+        context.metadata.setdefault("tracer", self.tracer)
+        context.metadata.setdefault("cost_tracker", self.cost_tracker)
+        if self.budget:
+            context.metadata.setdefault("budget", self.budget)
         run_id = context.run_id
         start_time = time.monotonic()
 

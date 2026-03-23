@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, ClassVar, Generic, TypeVar, cast, get_args, get_origin
 
 from pydantic import BaseModel, Field
+from pydantic.fields import FieldInfo
 
 from dopeagents.config import get_config
 from dopeagents.core.context import AgentContext
 from dopeagents.core.metadata import AgentMetadata
 from dopeagents.core.types import AgentResult
+
+logger = logging.getLogger(__name__)
 
 # Load .env if present (python-dotenv is a declared dependency)
 try:
@@ -162,26 +167,53 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
     # ── Extraction primitive (the ONLY place agents call LLMs) ───────
 
-    def _get_client(self, model: str | None = None) -> Any:
+    def _get_client(self, model: str | None = None, force_json_mode: bool = False) -> Any:
         """Get or create a cached Instructor client for the given model.
 
         The executor attaches observability hooks to this client so token/cost
         data is captured without any code inside the agent's run() method.
 
         Args:
-            model: Model string (e.g. "groq/llama-3.1-8b-instant"). Defaults to
-                   self._model.  Mode (TOOLS vs MD_JSON) is determined per model.
+                 model: Model string (e.g. "groq/llama-3.1-8b-instant"). Defaults to
+                     self._model.  Mode (TOOLS vs MD_JSON) is determined per model.
+                 force_json_mode: Force MD_JSON mode even if the model supports function calling.
 
         Returns:
             An instructor-patched LiteLLM client.
         """
+        import builtins
+        import contextlib
+        import io
+
         import instructor
         import litellm
 
         resolved_model = model or self._model
-        mode = (
-            instructor.Mode.MD_JSON if "groq" in resolved_model.lower() else instructor.Mode.TOOLS
-        )
+
+        # Suppress LiteLLM's verbose output during provider discovery
+        # (LiteLLM prints "Provider List" and other diagnostic messages)
+        original_print = builtins.print
+
+        def _filtered_print(*args: Any, **kwargs: Any) -> None:
+            """Filter out LiteLLM diagnostic messages."""
+            message = " ".join(str(arg) for arg in args)
+            if "Provider List" not in message and "docs.litellm.ai" not in message:
+                original_print(*args, **kwargs)
+
+        # Lock both stdout/stderr and print function to suppress all output
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            # Temporarily override print to silence LiteLLM
+            builtins.print = _filtered_print
+            try:
+                # Use TOOLS mode when the model supports function calling (most providers),
+                # fall back to MD_JSON for models that only support JSON completion.
+                supports_tools = (
+                    litellm.supports_function_calling(resolved_model) and not force_json_mode
+                )
+            finally:
+                builtins.print = original_print
+
+        mode = instructor.Mode.TOOLS if supports_tools else instructor.Mode.MD_JSON
 
         # Cache key is the mode (not the exact model, since mode drives schema format)
         cache_attr = f"_instructor_client_{mode.name}"
@@ -194,7 +226,7 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
         return getattr(self, cache_attr)
 
-    def _extract(
+    def _extract(  # noqa: C901
         self,
         response_model: type[BaseModel],
         messages: list[dict[str, str]],
@@ -226,62 +258,165 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
         # Determine model: explicit arg > instance default
         resolved_model = model or self._model
+        force_json_mode = bool(kwargs.pop("force_json_mode", False))
+        allow_fallback = bool(kwargs.pop("allow_fallback", False))
 
         # Use cached client (executor may have attached observability hooks)
-        litellm_client = self._get_client(resolved_model)
+        litellm_client = self._get_client(resolved_model, force_json_mode=force_json_mode)
 
-        # Pacing delay for groq free-tier TPM limits (~2 calls/sec)
-        if "groq" in resolved_model.lower():
-            time.sleep(0.5)
+        # Inject provider-specific kwargs (e.g. api_base) generically — no hardcoded providers.
+        provider = resolved_model.split("/")[0]
+        provider_config = get_config().get_provider_config(provider)
+        for key, value in provider_config.items():
+            kwargs.setdefault(key, value)
 
         for attempt in range(4):
             try:
-                result = litellm_client.chat.completions.create(
-                    model=resolved_model,
-                    response_model=response_model,
-                    messages=messages,
-                    **kwargs,
-                )
+                # Suppress harmless instructor library warning about on_completion_kwargs
+                # hook receiving an unexpected 'messages' argument (library compatibility quirk)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        category=UserWarning,
+                        message=".*on_completion_kwargs.*",
+                    )
+                    result = litellm_client.chat.completions.create(
+                        model=resolved_model,
+                        response_model=response_model,
+                        messages=messages,
+                        **kwargs,
+                    )
                 return cast(BaseModel, result)
             except Exception as exc:
-                exc_str = str(exc).lower()
-                if "rate_limit" not in exc_str and "429" not in exc_str:
-                    raise
+                import litellm as _litellm
 
-                # Parse retry-after from error message (e.g. "try again in 5m51s")
-                retry_after: int | None = None
-                m = re.search(r"try again in (\d+)m([\d.]+)s", str(exc))
-                if m:
-                    retry_after = int(m.group(1)) * 60 + int(float(m.group(2)))
+                # Unwrap tenacity RetryError — instructor retries validation/API
+                # failures internally; the real cause is buried in the last attempt.
+                actual_exc: BaseException = exc
+                if hasattr(exc, "last_attempt"):
+                    try:
+                        exc.last_attempt.result()  # re-raises the actual exception
+                    except Exception as inner:
+                        actual_exc = inner
 
-                # TPD (tokens per day) limit requires a very long wait — fail fast
-                # rather than hanging; let the caller surface a clean error.
-                if retry_after is not None and retry_after > 60:
-                    provider = "groq" if "groq" in resolved_model.lower() else "unknown"
+                # LiteLLM typed exceptions carry provider info directly — no model sniffing needed.
+                provider_name: str = getattr(actual_exc, "llm_provider", "unknown") or "unknown"
+
+                # Non-retryable: billing/auth/permissions — fail fast, no backoff.
+                if isinstance(
+                    actual_exc,
+                    (
+                        _litellm.AuthenticationError  # type: ignore[attr-defined]
+                        | _litellm.PermissionDeniedError  # type: ignore[attr-defined]
+                        | _litellm.BadRequestError  # type: ignore[attr-defined]
+                        | _litellm.NotFoundError  # type: ignore[attr-defined]
+                        | _litellm.BudgetExceededError  # type: ignore[attr-defined]
+                    ),
+                ):
                     raise ExtractionProviderError(
-                        message=(
-                            f"Daily token quota reached for {provider}. "
-                            f"Retry after {retry_after // 60}m{retry_after % 60}s."
-                        ),
+                        message=str(actual_exc),
+                        provider=provider_name,
+                        status_code=getattr(actual_exc, "status_code", None),
+                    ) from actual_exc
+
+                # Rate limit — exponential backoff with fast-fail for long waits.
+                if isinstance(
+                    actual_exc, (_litellm.RateLimitError | _litellm.RouterRateLimitError)
+                ):  # type: ignore[attr-defined]
+                    retry_after: int | None = None
+                    m = re.search(r"try again in (\d+)m([\d.]+)s", str(actual_exc))
+                    if m:
+                        retry_after = int(m.group(1)) * 60 + int(float(m.group(2)))
+
+                    if retry_after is not None and retry_after > 60:
+                        raise ExtractionProviderError(
+                            message=(
+                                f"Daily token quota reached. "
+                                f"Retry after {retry_after // 60}m{retry_after % 60}s."
+                            ),
+                            provider=provider,
+                            status_code=429,
+                            retry_after=retry_after,
+                        ) from actual_exc
+
+                    if attempt < 3:
+                        time.sleep(2**attempt)
+                        continue
+
+                    raise ExtractionProviderError(
+                        message=f"Rate limit exceeded after {attempt + 1} attempts.",
                         provider=provider,
                         status_code=429,
                         retry_after=retry_after,
-                    ) from exc
+                    ) from actual_exc
 
-                # Short TPM rate limit — exponential backoff (max 3 retries)
-                if attempt < 3:
-                    wait = 2**attempt  # 1, 2, 4 seconds
-                    time.sleep(wait)
-                    continue
+                if allow_fallback and (
+                    actual_exc.__class__.__name__ == "InstructorRetryException"
+                    or "Invalid JSON" in str(actual_exc)
+                    or hasattr(actual_exc, "last_completion")
+                ):
+                    logger.warning(
+                        "Structured extraction failed for %s; returning fallback output: %s",
+                        response_model.__name__,
+                        actual_exc,
+                    )
+                    return self._build_fallback_model(response_model)
 
-                provider = "groq" if "groq" in resolved_model.lower() else "unknown"
-                raise ExtractionProviderError(
-                    message=f"Rate limit exceeded after {attempt + 1} attempts.",
-                    provider=provider,
-                    status_code=429,
-                    retry_after=retry_after,
-                ) from exc
+                # Any other exception (validation error, network issue, etc.) — re-raise as-is.
+                raise actual_exc from exc
         raise RuntimeError("_extract: exhausted retries")  # unreachable
+
+    def _build_fallback_model(self, response_model: type[BaseModel]) -> BaseModel:
+        """Construct a permissive fallback instance for failed structured extraction."""
+
+        data: dict[str, Any] = {}
+        for name, field in response_model.model_fields.items():
+            data[name] = self._build_fallback_value_for_field(field)
+
+        return response_model.model_construct(**data)
+
+    def _build_fallback_value_for_field(self, field: FieldInfo) -> Any:
+        from types import NoneType
+
+        if not field.is_required():
+            if field.default_factory is not None:
+                return cast(Callable[..., Any], field.default_factory)()
+            return field.default
+
+        if field.default_factory is not None:
+            return cast(Callable[..., Any], field.default_factory)()
+
+        annotation = field.annotation
+        origin = get_origin(annotation)
+        args = get_args(annotation)
+
+        return self._build_fallback_value_for_annotation(annotation, origin, args, NoneType)
+
+    def _build_fallback_value_for_annotation(
+        self,
+        annotation: Any,
+        origin: Any,
+        args: tuple[Any, ...],
+        none_type: type,
+    ) -> Any:
+        if origin in (list, set, tuple):
+            return origin()
+        if origin is dict:
+            return {}
+        if origin is not None and none_type in args:
+            return None
+        if annotation is str:
+            return ""
+        if annotation is int:
+            return 0
+        if annotation is float:
+            return 0.0
+        if annotation is bool:
+            return False
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            return annotation.model_construct()
+
+        return None
 
     def _extract_partial(
         self,

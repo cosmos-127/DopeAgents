@@ -25,7 +25,7 @@ class InstructorObservabilityHooks:
     def __init__(self, span: Span) -> None:
         self.span = span
 
-    def on_completion_kwargs(self, kwargs: dict[str, Any]) -> None:
+    def on_completion_kwargs(self, **kwargs: Any) -> None:
         """Capture the request being sent to the LLM."""
         self.span.set_attribute("llm.model", kwargs.get("model", "unknown"))
         self.span.set_attribute("llm.messages_count", len(kwargs.get("messages", [])))

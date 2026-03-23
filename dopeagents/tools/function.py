@@ -8,10 +8,10 @@ from typing import Any, get_args, get_origin
 
 from pydantic import BaseModel, create_model
 
-from dopeagents.tools.base import Tool, ToolInputT, ToolOutputT
+from dopeagents.tools.base import Tool
 
 
-class FunctionTool(Tool):  # type: ignore[type-arg]
+class FunctionTool(Tool[BaseModel, BaseModel]):
     """Wraps a Python callable as a Tool.
 
     Introspects the function signature to:
@@ -57,7 +57,7 @@ class FunctionTool(Tool):  # type: ignore[type-arg]
         """Tool description."""
         return self._description
 
-    def input_type(self) -> type[ToolInputT]:
+    def input_type(self) -> type[BaseModel]:
         """Generate and cache the Pydantic input model from function signature.
 
         Inspects the function's parameters and type hints to create a dynamic
@@ -67,7 +67,7 @@ class FunctionTool(Tool):  # type: ignore[type-arg]
             Dynamic Pydantic model class
         """
         if self._input_model is not None:
-            return self._input_model  # type: ignore[return-value]
+            return self._input_model
 
         sig = inspect.signature(self.func)
         fields_dict: dict[str, Any] = {}
@@ -93,9 +93,9 @@ class FunctionTool(Tool):  # type: ignore[type-arg]
             __base__=BaseModel,
             **fields_dict,
         )
-        return self._input_model  # type: ignore[return-value]
+        return self._input_model
 
-    def output_type(self) -> type[ToolOutputT]:
+    def output_type(self) -> type[BaseModel]:
         """Return the output model.
 
         For FunctionTool, returns a generic BaseModel since the function
@@ -105,7 +105,7 @@ class FunctionTool(Tool):  # type: ignore[type-arg]
             OutputT model type
         """
         if self._output_model is not None:
-            return self._output_model  # type: ignore[return-value]
+            return self._output_model
 
         # Default: return the function's return type wrapped in a model
         sig = inspect.signature(self.func)
@@ -119,9 +119,9 @@ class FunctionTool(Tool):  # type: ignore[type-arg]
             result=(result_type, ...),
             __base__=BaseModel,
         )
-        return self._output_model  # type: ignore[return-value]
+        return self._output_model
 
-    def call(self, input: ToolInputT) -> ToolOutputT:  # type: ignore[type-var]
+    def call(self, input: BaseModel) -> BaseModel:
         """Execute the function with the given input.
 
         Args:
@@ -139,9 +139,9 @@ class FunctionTool(Tool):  # type: ignore[type-arg]
         # Wrap result if needed
         output_model: type[BaseModel] = self.output_type()
         if isinstance(result, dict):
-            return output_model(**result)  # type: ignore[return-value]
+            return output_model(**result)
         else:
-            return output_model(result=result)  # type: ignore[return-value]
+            return output_model(result=result)
 
     def function_schema(self) -> dict[str, Any]:
         """Generate JSON Schema from function type hints.

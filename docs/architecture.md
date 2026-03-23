@@ -1,3 +1,4 @@
+
 # Architecture
 
 ## Overview
@@ -31,7 +32,7 @@ The system is organized into five distinct layers, each with a clear responsibil
 │                      Agent Layer                                 │
 │                                                                  │
 │   Agent[InputT, OutputT] base class                              │
-│   DeepSummarizer    ResearchAgent    (user-defined agents)       │
+│   DeepSummarizer    DeepResearcher    (user-defined agents)      │
 │   Pydantic I/O contracts    step_prompts    _build_graph()       │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
@@ -122,19 +123,31 @@ instructor.from_litellm(litellm.completion)
 
 **Implementation:** The `Agent[InputT, OutputT]` generic base class. Concrete agents subclass this, declare their metadata and step prompts, define `_build_graph()`, implement step methods, and implement `run()`.
 
-**Key design decision:** Agents contain **only workflow logic**. No infrastructure code appears in any agent — no cost tracking, no retry logic, no observability spans, no JSON parsing, no provider-specific code. Each step method contains exactly one concern: its domain logic, expressed as a call to `_extract()` with a prompt and a response schema.
+**Key design decision:** Agents contain **only workflow logic**. No infrastructure _implementation_ appears in any agent — no cost tracking, no retry logic, no JSON parsing, no provider-specific code. Each step method contains exactly one concern: its domain logic, expressed as a call to `_extract()` with a prompt and a response schema.
+
+Agents _cooperate_ with the Lifecycle Layer through lightweight helpers that read from `context.metadata` (populated by `AgentExecutor`):
+
+- **`_step_span(step_name)`** — creates a tracer span if a tracer was injected via `context.metadata["tracer"]`. When no tracer is present (direct `run()` without an executor), yields `None` and step executes normally.
+- **`_budget_config()`** — reads `BudgetConfig` from `context.metadata["budget"]` if present. Agents use this to respect budget limits (e.g., capping refinement loops).
+- **`_model_for_step(step_name)`** — resolves per-step model overrides from `step_models`, falling back to `self._model`.
+
+This is a read-only, opt-in bridge — agents never import or instantiate lifecycle components. They access what the executor injected, or gracefully degrade when running standalone.
 
 ```python
-# This is the ENTIRE implementation of a step. Nothing else.
-def _evaluate_quality(self, state: dict) -> dict:
-    evaluation = self._extract(
-        response_model=QualityEvaluation,
-        messages=[
-            {"role": "system", "content": self.step_prompts["evaluate"]},
-            {"role": "user", "content": f"Original: {state['document'][:3000]}\n\nSummary: {state['draft_summary']}"},
-        ],
-    )
-    return {"quality_score": evaluation.score, "feedback": evaluation.feedback}
+# A typical step: domain logic + lightweight lifecycle cooperation.
+def _step_evaluate(self, state: dict) -> dict:
+    with self._step_span("evaluate") as span:
+        evaluation = self._extract(
+            response_model=QualityEvaluation,
+            messages=[
+                {"role": "system", "content": self.step_prompts["evaluate"]},
+                {"role": "user", "content": f"Original: {state['document'][:3000]}\n\nSummary: {state['draft_summary']}"},
+            ],
+            model=self._model_for_step("evaluate"),
+        )
+        if span:
+            span.set_attribute("quality_score", evaluation.score)
+        return {"quality_score": evaluation.score, "feedback": evaluation.feedback}
 ```
 
 **What lives here:**
@@ -149,10 +162,12 @@ def _evaluate_quality(self, state: dict) -> dict:
 - `debug()` — returns graph structure, step prompts, and step schemas without execution
 - `describe()` — returns agent metadata for discovery and composition
 - Class metadata: `name`, `version`, `description`, `capabilities`, `tags`
+- Lifecycle cooperation helpers: `_step_span()`, `_budget_config()`, `_model_for_step()`
+- `ExtractionProviderError` re-raise in `run()` — lets the executor handle auth/billing/quota errors
 
 **What does NOT live here:**
 
-- Any infrastructure concern (cost, retry, tracing, caching, budget)
+- Infrastructure _implementation_ (cost tracking, retry, caching, budget enforcement)
 - Any framework-specific code beyond the `_extract()` call
 - Any direct LLM interaction (always goes through `_extract()`)
 
@@ -162,12 +177,13 @@ def _evaluate_quality(self, state: dict) -> dict:
 
 **Implementation:** The `AgentExecutor` class, along with supporting components: `CostTracker`, `BudgetConfig`, `RetryPolicy`, `DegradationChain`, tracer implementations, and cache implementations.
 
-**Key design decision:** The Lifecycle Layer wraps agents **from the outside**. Agents are unaware of its existence. This means:
+**Key design decision:** The Lifecycle Layer wraps agents **from the outside** and communicates inward via `context.metadata`. Agents don't import lifecycle components — the executor populates `context.metadata["tracer"]` and `context.metadata["budget"]` before calling `agent.run()`, and agents read these through lightweight helpers (`_step_span()`, `_budget_config()`). This means:
 
-- Agents can be tested without any lifecycle infrastructure (just call `run()` directly)
+- Agents can be tested without any lifecycle infrastructure (just call `run()` directly — helpers return `None` gracefully)
 - Lifecycle policies can be changed per-execution without modifying the agent
 - Multiple lifecycle configurations can wrap the same agent instance
 - New lifecycle concerns (e.g., rate limiting, A/B testing) can be added without touching any agent code
+- Agents re-raise `ExtractionProviderError` (auth/billing/quota failures) so the executor can apply retry policies or fallback chains
 
 ```
 AgentExecutor.run(agent, input, context)
@@ -185,7 +201,7 @@ AgentExecutor.run(agent, input, context)
        ├── [per step] ──► Retry on transient failure
        │
        ▼
-   AgentExecutionResult
+   AgentResult[OutputT]
        │
        ├── output: OutputT (typed agent output)
        ├── metrics: ExecutionMetrics
@@ -430,7 +446,7 @@ dopeagents/
 ├── agents/                        # Concrete agent implementations
 │   ├── __init__.py                # Re-exports all agents + their I/O types
 │   ├── deep_summarizer.py         # DeepSummarizer + Input/Output models
-│   ├── research_agent.py          # ResearchAgent + Input/Output models
+│   ├── deep_researcher.py         # DeepResearcher + Input/Output models
 │   └── ...                        # Future agents
 │
 ├── contracts/                     # Typed composition
@@ -440,28 +456,36 @@ dopeagents/
 │
 ├── lifecycle/                     # Lifecycle Layer
 │   ├── __init__.py
-│   ├── executor.py                # AgentExecutor — wraps run() with lifecycle
-│   └── result.py                  # AgentExecutionResult, ExecutionMetrics, StepMetrics
+│   ├── executor.py                # AgentExecutor — wraps run() with full lifecycle
+│   ├── hooks.py                   # LifecycleHooks — pre/post execution callbacks
+│   └── result.py                  # (stub — AgentResult, ExecutionMetrics, StepMetrics live in core/types.py)
 │
 ├── cost/                          # Cost tracking and budget enforcement
 │   ├── __init__.py
 │   ├── tracker.py                 # CostTracker — accumulates per-step, per-agent, global
-│   └── budget.py                  # BudgetConfig — limits at multiple granularities
+│   └── guard.py                   # BudgetConfig + BudgetGuard — limits at multiple granularities
 │
 ├── resilience/                    # Retry, fallback, degradation
 │   ├── __init__.py
 │   ├── retry.py                   # RetryPolicy — step-level retry with backoff
-│   └── degradation.py            # DegradationChain — agent-level fallback
+│   ├── fallback.py                # FallbackChain — ordered agent fallback
+│   └── degradation.py             # DegradationChain — most-capable to most-reliable ordering
 │
 ├── observability/                 # Tracing and debugging
 │   ├── __init__.py
-│   ├── tracer.py                  # Tracer protocol + ConsoleTracer
+│   ├── tracer.py                  # Tracer ABC, Span, NoopTracer, ConsoleTracer
 │   ├── otel.py                    # OTelTracer — OpenTelemetry integration
-│   └── debug.py                   # DebugInfo — graph + prompts + schemas without execution
+│   ├── instructor_hooks.py        # InstructorObservabilityHooks — per-call cost/token capture
+│   ├── logging.py                 # Internal logger helpers
+│   └── debug.py                   # (stub — DebugInfo lives in core/agent.py)
 │
-├── adapters/                      # Wrapping external code
+├── adapters/                      # Framework adapters and wrapping utilities
 │   ├── __init__.py
-│   └── wrap.py                    # wrap_function(), wrap_class()
+│   ├── wrap.py                    # wrap_function(), wrap_class()
+│   ├── langchain_adapter.py       # LangChain Runnable adapter
+│   ├── langgraph_adapter.py       # LangGraph node adapter
+│   ├── crewai_adapter.py          # CrewAI tool adapter
+│   └── autogen_adapter.py         # AutoGen function adapter
 │
 ├── mcp_server/                    # MCP exposure
 │   ├── __init__.py
@@ -605,81 +629,19 @@ The Lifecycle Layer instruments `_extract()` — not by modifying it, but by hoo
 
 ---
 
-## Cost Tracking Architecture
+## Cost Tracking and Budget Architecture
 
-Cost tracking is designed around a simple principle: **cost data originates at the extraction point and aggregates upward**.
+Cost data originates at the extraction point (`_extract()`) and aggregates upward through `StepMetrics` → `ExecutionMetrics` → `CostTracker`. Budget enforcement (`BudgetConfig`) runs at three granularities: per-step, per-agent-run, and globally. When `on_exceeded="degrade"`, budget exhaustion during a refinement loop returns the best partial result rather than discarding all completed work.
 
-```
-_extract() call
-    │
-    ├── LiteLLM response includes: response_cost, prompt_tokens, completion_tokens
-    │
-    ▼
-StepMetrics (per step)
-    │
-    ├── step_name, cost_usd, tokens, latency_ms, model
-    │
-    ▼
-ExecutionMetrics (per agent run)
-    │
-    ├── total_cost_usd, total_latency_ms, steps: list[StepMetrics]
-    │
-    ▼
-CostTracker (session-wide)
-    │
-    ├── total_cost_usd
-    ├── by_agent: {agent_name: {cost, calls, avg_cost, by_step: {...}}}
-    │
-    ▼
-BudgetConfig (enforcement)
-    │
-    ├── max_cost_per_step   → checked after each _extract()
-    ├── max_cost_per_call   → checked after each step completes
-    ├── max_cost_global     → checked before each agent run
-    └── on_exceeded         → "error" | "degrade"
-```
-
-### Budget Enforcement Points
-
-Budget is checked at three points during execution:
-
-1. **Before agent run:** Is the global budget already exhausted? If so, don't start.
-2. **After each `_extract()` call:** Has this step exceeded `max_cost_per_step`? If so, either error or degrade.
-3. **After each graph step completes:** Has the total run exceeded `max_cost_per_call`? If so, either error or return best-so-far.
-
-The `on_exceeded="degrade"` mode is critical for agents with refinement loops. If budget is hit during refinement round 3, the agent returns the output from refinement round 2 — the best result produced within budget — rather than discarding all work.
+> **Full specification:** See [Design_Document.md §8 — Cost Management & Budget Guards](Design_Document.md#8-cost-management--budget-guards) for the complete implementation spec, enforcement points, and degradation semantics.
 
 ---
 
 ## Retry Architecture
 
-Retry operates at three distinct levels, each handling different failure modes:
+Retry operates at three levels: **Extraction** (Instructor re-asks on schema validation failure), **Step** (exponential backoff on transient infrastructure errors — only the failed step retries, preserving completed graph state), and **Agent** (`DegradationChain` tries agents in order until one succeeds). The step-level boundary is the key architectural property: because LangGraph preserves state across steps, step 5 retrying does not re-execute steps 1–4.
 
-```
-Level 1: Extraction (Instructor)
-├── Handles: Schema validation failures (missing fields, wrong types)
-├── Mechanism: Instructor re-asks the LLM with validation error in prompt
-├── Scope: Single _extract() call
-├── Transparent to: Agent step methods (they never see the retry)
-│
-Level 2: Step (DopeAgents Lifecycle Layer)
-├── Handles: Infrastructure failures (timeouts, rate limits, transient errors)
-├── Mechanism: RetryPolicy with exponential backoff
-├── Scope: Single graph step (not the entire agent run)
-├── Key property: Only the failed step retries; completed steps are preserved
-│
-Level 3: Agent (DegradationChain)
-├── Handles: Fundamental failures (model down, context too long, persistent errors)
-├── Mechanism: Try agents in order until one succeeds
-├── Scope: Entire agent — falls through to simpler alternatives
-├── Key property: Last agent in chain should always succeed (e.g., no-LLM fallback)
-```
-
-### Step-Level Retry Boundary
-
-The most architecturally significant decision in the retry system is that **step-level retry re-executes only the failed step, not the entire agent**. This is possible because LangGraph maintains graph state across steps. When step 5 fails and retries, steps 1–4 are not re-executed — their results are preserved in the graph state.
-
-This is especially important for expensive agents. A DeepSummarizer run involves 5–8 LLM calls. Re-running the entire agent on a step 5 failure would double the cost. Re-running only step 5 adds marginal cost.
+> **Full specification:** See [Design_Document.md §9 — Resilience Layer](Design_Document.md#9-resilience-layer--retry-fallback-degradation) for complete retry policy specs, fallback semantics, and degradation chain behaviour.
 
 ---
 
@@ -792,6 +754,8 @@ Layer 1: Debug Mode (no execution)
 │
 Layer 2: Step-Level Metrics (always captured)
 ├── Every _extract() call records: cost, tokens, latency, model, step name
+├── Agents wrap steps with _step_span() — creates a child span per step
+│   when a tracer is present in context.metadata["tracer"]
 ├── Available in ExecutionMetrics.steps after run completes
 ├── No additional configuration needed
 │
@@ -864,7 +828,7 @@ class Tracer(Protocol):
     def on_agent_start(self, agent: Agent, input: BaseModel) -> None: ...
     def on_step_start(self, step_name: str) -> None: ...
     def on_step_end(self, step_name: str, metrics: StepMetrics) -> None: ...
-    def on_agent_end(self, result: AgentExecutionResult) -> None: ...
+    def on_agent_end(self, result: AgentResult) -> None: ...
 ```
 
 Pass the implementation to `AgentExecutor(tracer=MyTracer())`. All agents automatically emit events to the new tracer.

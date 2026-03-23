@@ -1,0 +1,68 @@
+On branch main
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+	modified:   .gitignore
+	modified:   README.md
+	modified:   docs/Design_Document.md
+	modified:   docs/Implementation_Roadmap.md
+	modified:   docs/Technical_Overview.md
+	modified:   docs/architecture.md
+	modified:   dopeagents/__init__.py
+	new file:   dopeagents/agent_utils/__init__.py
+	new file:   dopeagents/agent_utils/chunking.py
+	new file:   dopeagents/agent_utils/content_extractor.py
+	new file:   dopeagents/agent_utils/credibility.py
+	new file:   dopeagents/agent_utils/fact_checker.py
+	new file:   dopeagents/agent_utils/search_providers.py
+	new file:   dopeagents/agent_utils/text_utils.py
+	modified:   dopeagents/agents/__init__.py
+	new file:   dopeagents/agents/_researcher/__init__.py
+	new file:   dopeagents/agents/_researcher/claim_analysis.py
+	new file:   dopeagents/agents/_researcher/confidence.py
+	new file:   dopeagents/agents/_researcher/hybrid_step.py
+	new file:   dopeagents/agents/_researcher/memory.py
+	new file:   dopeagents/agents/_researcher/model_capability.py
+	new file:   dopeagents/agents/_researcher/progress.py
+	new file:   dopeagents/agents/_researcher/report_generator.py
+	new file:   dopeagents/agents/_researcher/tools.py
+	new file:   dopeagents/agents/_summarizer/__init__.py
+	new file:   dopeagents/agents/_summarizer/analyzer.py
+	new file:   dopeagents/agents/_summarizer/chunker.py
+	new file:   dopeagents/agents/_summarizer/formatter.py
+	new file:   dopeagents/agents/_summarizer/schemas.py
+	new file:   dopeagents/agents/agent_flows/deep_researcher.mmd
+	modified:   dopeagents/agents/agent_flows/deep_summarizer.mmd
+	new file:   dopeagents/agents/deep_researcher.py
+	modified:   dopeagents/agents/deep_summarizer.py
+	deleted:    dopeagents/agents/research_agent.py
+	modified:   dopeagents/config.py
+	modified:   dopeagents/core/agent.py
+	modified:   dopeagents/core/types.py
+	modified:   dopeagents/lifecycle/executor.py
+	modified:   dopeagents/observability/instructor_hooks.py
+	modified:   dopeagents/tools/base.py
+	modified:   dopeagents/tools/function.py
+	new file:   examples/deep_researcher_usage.py
+	new file:   examples/deep_summarizer_usage.py
+	modified:   pyproject.toml
+	modified:   scripts/check_free_models.py
+	new file:   scripts/test_model_access.py
+	new file:   test_context_providers.py
+	new file:   test_output.txt
+	new file:   tests/agents/test_deep_research.py
+	modified:   tests/agents/test_deep_summarizer.py
+	new file:   tests/config/__init__.py
+	renamed:    tests/test_config.py -> tests/config/test_config.py
+	new file:   tests/errors/__init__.py
+	renamed:    tests/test_errors.py -> tests/errors/test_errors.py
+	new file:   tests/infrastructure/__init__.py
+	renamed:    tests/test_infrastructure.py -> tests/infrastructure/test_infrastructure.py
+	modified:   tests/integration/test_composition.py
+	new file:   tests/observability/__init__.py
+	renamed:    tests/test_token_tracking.py -> tests/observability/test_token_tracking.py
+	modified:   uv.lock
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	git_status.txt
+

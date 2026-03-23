@@ -26,6 +26,9 @@ class DopeAgentsConfig(BaseSettings):
     # These live in config (not .env) — they're defaults, not secrets.
     # Override any of them via DOPEAGENTS_<FIELD> env var if needed.
 
+    nvidia_nim_default_model: str = "nvidia_nim/meta/llama-3.3-70b-instruct"
+    """Default model for NVIDIA NIM provider."""
+
     groq_default_model: str = "groq/llama-3.3-70b-versatile"
     """Default model for Groq provider."""
 
@@ -38,6 +41,8 @@ class DopeAgentsConfig(BaseSettings):
     # ── Provider API keys (read from bare env vars, not DOPEAGENTS_ prefixed) ──
     # Just uncomment the matching key in .env — config auto-detects provider.
 
+    nvidia_nim_api_key: str | None = Field(default=None, alias="NVIDIA_NIM_API_KEY")
+    nvidia_nim_api_base: str | None = Field(default=None, alias="NVIDIA_NIM_API_BASE")
     groq_api_key: str | None = Field(default=None, alias="GROQ_API_KEY")
     openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
     together_api_key: str | None = Field(default=None, alias="TOGETHER_API_KEY")
@@ -150,25 +155,66 @@ class DopeAgentsConfig(BaseSettings):
         """Load configuration from environment variables."""
         return cls()
 
+    def has_api_key(self) -> bool:
+        """Check if any LLM API key is available (respecting provider priority).
+
+        Returns True if any of NVIDIA_NIM_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY,
+        or TOGETHER_API_KEY is set (via environment variable or .env file).
+
+        Priority order (same as resolve_model):
+          1. NVIDIA_NIM_API_KEY
+          2. GROQ_API_KEY
+          3. OPENROUTER_API_KEY
+          4. TOGETHER_API_KEY
+        """
+        return bool(
+            self.nvidia_nim_api_key
+            or self.groq_api_key
+            or self.openrouter_api_key
+            or self.together_api_key
+        )
+
     def resolve_model(self) -> str:
         """Return the active model, auto-detecting from whichever API key is set.
 
         Priority:
           1. DOPEAGENTS_DEFAULT_MODEL (explicit override in .env)
-          2. GROQ_API_KEY present  → groq_default_model
-          3. OPENROUTER_API_KEY present → openrouter_default_model
-          4. TOGETHER_API_KEY present  → together_default_model
-          5. groq_default_model (hardcoded fallback)
+          2. NVIDIA_NIM_API_KEY present → nvidia_nim_default_model
+          3. GROQ_API_KEY present → groq_default_model
+          4. OPENROUTER_API_KEY present → openrouter_default_model
+          5. TOGETHER_API_KEY present → together_default_model
+          6. nvidia_nim_default_model (hardcoded fallback)
         """
         if self.default_model:
             return self.default_model
+        if self.nvidia_nim_api_key:
+            return self.nvidia_nim_default_model
         if self.groq_api_key:
             return self.groq_default_model
         if self.openrouter_api_key:
             return self.openrouter_default_model
         if self.together_api_key:
             return self.together_default_model
-        return self.groq_default_model
+        return self.nvidia_nim_default_model
+
+    def get_provider_config(self, provider: str) -> dict[str, str]:
+        """Return extra LiteLLM kwargs for the given provider prefix.
+
+        Provider prefix is the first segment of the model string, e.g.
+        ``"nvidia"`` from ``"nvidia/nemotron-3-super-120b-a12b"``.
+
+        Used by ``Agent._extract()`` to inject provider-specific settings
+        (e.g. custom ``api_base``) without hardcoding provider names in
+        the call-site.
+
+        Returns an empty dict for providers that need no extra config.
+
+        Note: NVIDIA requires custom api_base injection (custom NIM endpoint),
+        hence the check. Other providers rely on litellm's default routing.
+        """
+        if provider in ("nvidia", "nvidia_nim") and self.nvidia_nim_api_base:
+            return {"api_base": self.nvidia_nim_api_base}
+        return {}
 
 
 # ── Global singleton management ────────────────────────────────────

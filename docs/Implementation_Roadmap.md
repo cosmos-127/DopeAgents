@@ -14,14 +14,14 @@
 | 0     | Foundation                  | ✅ COMPLETE | All core types, Agent base, errors defined |
 | 1     | DeepSummarizer (7-step)     | ✅ COMPLETE | Full workflow, step_prompts customizable    |
 | 2     | Infrastructure Layer        | ✅ COMPLETE | Cost tracking, budget guards, caching, resilience |
-| 3     | ResearchAgent + Composition | ✅ COMPLETE | 6-step agent, step_prompts customizable    |
+| 3     | DeepResearcher + Composition | ✅ COMPLETE | 13-step hybrid agent, step_prompts customizable |
 | 4     | MCP Exposure                | ⏳ NOT STARTED | FastMCP server and tool registration       |
 | 5     | CLI, Sandbox & Polish       | ⏳ NOT STARTED | CLI commands, interactive REPL, wrapping   |
 
 ### Key Milestones Achieved
 
 - ✅ **Design Decision (DD-035)**: Implemented immutable `system_prompt` (ClassVar only) + customizable `step_prompts` (init-time, instance-level)
-- ✅ **Pattern Standardization**: Both DeepSummarizer and ResearchAgent use identical `step_prompts` customization in `__init__`
+- ✅ **Pattern Standardization**: Both DeepSummarizer and DeepResearcher use identical `step_prompts` customization in `__init__`
 - ✅ **Documentation Sync**: Design_Document.md §3.6 updated with implementation details, code examples, and design rationale
 
 ### Architectural Decision: Step Prompts Customization (DD-035)
@@ -34,7 +34,7 @@
 
 **Pattern Used in Both Agents**:
 ```python
-# In DeepSummarizer.__init__ and ResearchAgent.__init__:
+# In DeepSummarizer.__init__ and DeepResearcher.__init__:
 def __init__(self, **kwargs: Any) -> None:
     custom_step_prompts = kwargs.pop("step_prompts", None)
     super().__init__(**kwargs)
@@ -63,7 +63,7 @@ agent2.run(input2)  # Uses merged custom + default prompts
 
 **Where Implemented**:
 - [dopeagents/agents/deep_summarizer.py](dopeagents/agents/deep_summarizer.py#L262) — Lines 262–280
-- [dopeagents/agents/research_agent.py](dopeagents/agents/research_agent.py#L187) — Lines 187–202
+- [dopeagents/agents/deep_researcher.py](dopeagents/agents/deep_researcher.py#L479) — Lines 479–487
 - [docs/Design_Document.md](docs/Design_Document.md#L1136) — §3.6 with code examples and design rationale
 
 ---
@@ -89,7 +89,7 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 | 0     | Foundation                  | Small  | Nothing     | ✅ COMPLETE  |
 | 1     | DeepSummarizer (7-step)     | Large  | Phase 0     | ✅ COMPLETE  |
 | 2     | Infrastructure Layer        | Large  | Phase 0 + 1 | ✅ COMPLETE  |
-| 3     | ResearchAgent + Composition | Large  | Phase 0 + 2 | ✅ COMPLETE  |
+| 3     | DeepResearcher + Composition | Large  | Phase 0 + 2 | ✅ COMPLETE  |
 | 4     | MCP Exposure                | Medium | Phase 0 + 1 | ⏳ NOT STARTED |
 | 5     | CLI, Sandbox & Polish       | Medium | All above   | ⏳ NOT STARTED |
 
@@ -117,7 +117,7 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 - Create all subdirectories: `core/`, `sandbox/`, `contracts/`, `lifecycle/`, `observability/`, `cost/`, `resilience/`, `cache/`, `adapters/`, `spec/`, `registry/`, `benchmark/`, `tools/`, `agents/`, `security/`
 - For each directory, create `__init__.py` with appropriate re-exports (empty for now; detailed in T0.4–T0.6)
 - Create `dopeagents/py.typed` (empty file; PEP 561 marker)
-- Create stub `.py` files for each module per the directory tree (e.g., `dopeagents/core/agent.py`, `dopeagents/agents/deep_summarizer.py`, `dopeagents/agents/research_agent.py`, etc.); stub content is a docstring and `pass` for now
+- Create stub `.py` files for each module per the directory tree (e.g., `dopeagents/core/agent.py`, `dopeagents/agents/deep_summarizer.py`, `dopeagents/agents/deep_researcher.py`, etc.); stub content is a docstring and `pass` for now
 - Create `tests/` directory structure mirroring `dopeagents/` (e.g., `tests/core/`, `tests/agents/`, etc.)
 - Create `.gitignore` with entries for `.venv`, `__pycache__`, `.pytest_cache`, `*.egg-info`, `dist/`, `build/`, `.mypy_cache`, `ruff_cache/`, `.ruff_cache`, `.cache`, `*.db`
 
@@ -130,37 +130,39 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
   - `description = "Agentic AI framework with structured contracts, cost tracking, and multi-framework support"`
   - `authors = [...]`, `license = {...}`, `readme = "README.md"`
 - Declare all core dependencies with version pins (DD §2.2):
-  - `pydantic >= 2.11`
+  - `pydantic >= 2.12`
+  - `pydantic-settings >= 2.12`
   - `instructor >= 1.14`
-  - `litellm >= 1.56`
-  - `langgraph >= 0.2`
+  - `litellm >= 1.80`
+  - `langgraph >= 1.1.3, < 2.0`
+  - `python-dotenv >= 1.0`
   - `typing-extensions >= 4.12`
   - `click >= 8.1`
   - `jsonschema >= 4.23`
   - `httpx >= 0.27`
+  - `rich >= 13.0`
   - `packaging >= 21.0` (required by Registry version parsing — DD §14)
 - Declare optional dependency groups:
   - `mcp`: `fastmcp >= 3.0, < 4.0`
   - `cache`: `diskcache >= 5.6`
   - `otel`: `opentelemetry-api`, `opentelemetry-sdk`
-  - `langchain`: `langchain-core >= 0.2`
-  - `langgraph-adapter`: `langgraph >= 0.2` (separate from core langgraph if needed)
-  - `crewai`: `crewai >= 0.30`
-  - `autogen`: `autogen-agentchat >= 0.2`
+  - `langchain`: `langchain >= 0.1`
+  - `crewai`: `crewai >= 1.0`
+  - `autogen`: `autogen-agentchat >= 0.4`
 - Configure `[project.scripts]` entry point: `dopeagents = dopeagents.cli:main`
 - Configure `[tool.pytest.ini_options]` with `testpaths = ["tests"]`
 - **Linter**: configure `ruff` under `[tool.ruff]`:
   - `line-length = 100`
-  - `target-version = "py311"`
+  - `target-version = "py312"`
   - `select = ["E", "F", "I", "UP", "B", "SIM"]` (errors, undefined names, imports, pyupgrade, bugbear, simplify)
   - Enable `[tool.ruff.lint.isort]` for import sorting
 - **Type checker**: configure `mypy` strict mode under `[tool.mypy]`:
   - `strict = true`
-  - `python_version = "3.11"`
+  - `python_version = "3.12"`
   - `ignore_missing_imports = true`
   - `disallow_untyped_defs = true`
 - Add `ruff`, `mypy`, `pytest`, `pytest-cov` to `[dependency-groups.dev]` (installed via `uv sync --group dev`)
-- Configure `[tool.uv]` with `python = "^3.11"`
+- Configure `[tool.uv]` with `python = "^3.12"`
 
 #### T0.2 — `dopeagents/py.typed` marker
 
@@ -189,14 +191,7 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 - File: `dopeagents/core/context.py`
 - Implement `AgentContext` (DD §3.3):
   - `run_id: UUID` (auto-generated)
-  - `trace_id: UUID | None`
-  - `parent_agent: str | None`
-  - `timestamp: datetime`
-  - `environment: str = "development"`
-  - `max_cost_usd: float | None`
-  - `max_tokens: int | None`
-  - `model_override: str | None`
-  - `mcp_request_id: str | None`
+  - `created_at: datetime` (default: `datetime.now(UTC)`)
   - `metadata: dict[str, Any]`
 
 #### T0.5 — `dopeagents/core/types.py` — result and metrics models
@@ -236,7 +231,7 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
   - Framework adapter stubs: `as_langchain_runnable()`, `as_langgraph_node()`, `as_crewai_tool()`, `as_autogen_function()`, `as_openai_function()`, `as_callable()`, `as_mcp_tool()`, `as_mcp_server()`
 - Implement `DebugInfo` and `AgentDescription` models in the same file.
 
-> **Refinement note**: Added `as_langgraph_node()` to the adapter stubs list. DD §11.2 defines a full LangGraph adapter (`to_langgraph_node()`) that was missing from the original roadmap. The stub delegates to `dopeagents.adapters.langgraph.to_langgraph_node()`.
+> **Refinement note**: Added `as_langgraph_node()` to the adapter stubs list. DD §11.2 defines a full LangGraph adapter (`to_langgraph_node()`) that was missing from the original roadmap. The stub delegates to `dopeagents.adapters.langgraph_adapter.to_langgraph_node()`.
 
 #### T0.8 — `dopeagents/config.py` — `DopeAgentsConfig`
 
@@ -479,7 +474,7 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 
 | Risk                                                                                                             | Mitigation                                                                                       |
 | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| LangGraph `StateGraph` API differences between `0.2.x` and later — `add_conditional_edges` shape may vary | Pin `langgraph >= 0.2, < 0.3` initially; test with the exact pinned version in CI              |
+| LangGraph `StateGraph` API differences between minor versions — `add_conditional_edges` shape may vary | Pin `langgraph >= 1.1.3, < 2.0` (already in `pyproject.toml`); test with the exact pinned version in CI |
 | `_step_summarize` iterates chunks = N calls to `_extract()`; token cost per run is unbounded                 | Add a `max_chunks` guard (default 10); truncate chunk list before the loop                     |
 | Refinement loop diverges — quality never reaches 0.8 for some inputs                                            | `max_refinement_loops` guard in state (default 3); `degrade` path returns best result so far |
 | Per-step model assignments are implicit in step_prompts defaults                                                 | Document step model strategy in class docstring; exposed via `describe()`                      |
@@ -704,9 +699,9 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 
 ---
 
-## Phase 3: Second Agent — ResearchAgent + Composition
+## Phase 3: Second Agent — DeepResearcher + Composition
 
-**What**: The second production agent (ResearchAgent, 6-step), plus the contract verification and pipeline composition system. Proves that two distinct multi-step agents compose correctly.
+**What**: The second production agent (`DeepResearcher`, 13-step hybrid with real web search and bounded LLM tool calling), plus the contract verification and pipeline composition system. Proves that two distinct multi-step agents compose correctly.
 
 **Depends on**: Phase 0 (base classes), Phase 2 (infrastructure layer — lifecycle executor must exist to test pipeline end-to-end).
 
@@ -741,57 +736,90 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 - Implement `RESTTool` (DD §16): `httpx`-backed REST call with `RESTToolConfig`
 - Must implement `input_type()` from `Tool` ABC
 
-#### T3.4 — Design the ResearchAgent LangGraph state
+#### T3.4 — Design the DeepResearcher LangGraph state
 
-- File: `dopeagents/agents/research_agent.py`
-- Define `ResearchState` TypedDict with all state keys shared across steps:
-  - `query`, `max_sources`, `depth`
-  - `sub_queries: list[str]` (formulate step out)
-  - `raw_results: list[dict]` (search step out)
-  - `scored_sources: list[dict]` (evaluate step out)
-  - `draft_report: str` (synthesize step out)
-  - `fact_check_notes: list[str]` (fact_check step out)
-  - `final_report: str`, `citations: list[str]`, `confidence_scores: dict[str, float]`, `sub_queries_used: list[str]` (compose step out)
-- Define all internal step output schemas (`_FormulateOut`, `_SearchOut`, `_EvaluateSourcesOut`, `_SynthesizeOut`, `_FactCheckOut`, `_ComposeOut`) as private Pydantic models.
+- File: `dopeagents/agents/deep_researcher.py`
+- Define `DeepResearcherState` TypedDict with all state keys shared across 13 steps:
+  - Input: `query`, `research_focus`, `quality_threshold`, `max_refinement_loops`
+  - Step 1 (load_context): `prior_context`, `known_sources`
+  - Step 2 (expand_query): `expanded_queries`, `search_strategy`
+  - Step 3 (real_search): `search_results`
+  - Step 4 (extract_content): `extracted_content`
+  - Step 5 (score_sources): `credibility_scores`
+  - Step 6 (deep_analysis): `claims`, `verified_claims`, `tool_usage`, `tool_insights`, `additional_sources`
+  - Step 7 (cross_reference): `claim_clusters`, `information_gaps`
+  - Step 8 (synthesize): `synthesis`, `key_findings`, `citations`
+  - Step 9 (calculate_confidence): `calculated_confidence`, `confidence_breakdown`
+  - Step 10 (evaluate): `quality_score`, `evaluation_feedback`
+  - Step 12 (generate_report): `structured_report`, `markdown_report`, `report_title`
+  - Step 13 (save_session): `session_id`
+  - Refinement tracking: `refinement_rounds`
+- Define all internal step output schemas (`_ExpandQueryOut`, `_SynthesizeOut`, `_EvaluateOut`, `_GapAnalysisOut`, `_HybridAnalysisOut`) as private Pydantic models.
 
-#### T3.5 — Implement `ResearchInput` and `ResearchOutput`
+#### T3.5 — Implement `DeepResearcherInput` and `DeepResearcherOutput`
 
-- File: `dopeagents/agents/research_agent.py`
-- `ResearchInput` (DD §17.2):
+- File: `dopeagents/agents/deep_researcher.py`
+- `DeepResearcherInput` (DD §17.2):
   - `query: str = Field(min_length=5)`
-  - `max_sources: int = Field(default=10, ge=2, le=50)`
-  - `depth: Literal["quick", "standard", "deep"] = "standard"`
-- `ResearchOutput` (DD §17.2):
-  - `report: str`, `sources: list[str]`, `confidence_scores: dict[str, float]`, `citations: list[str]`, `fact_check_notes: list[str]`, `sub_queries_used: list[str]`
+  - `research_focus: str | None = None` — 'academic', 'practical', 'recent_news', 'comprehensive'
+  - `quality_threshold: float = Field(default=0.75, ge=0.0, le=1.0)`
+  - `max_refinement_loops: int = Field(default=2, ge=0, le=5)`
+  - `report_format: ReportFormat = Field(default=ReportFormat.MARKDOWN)`
+  - `enable_fact_check: bool = True`
+  - `enable_memory: bool = True`
+  - `enable_tool_calling: bool | None = None` — None = auto-detect from model capability
+  - `tool_budget: int = Field(default=5, ge=0, le=10)`
+- `DeepResearcherOutput` (DD §17.2):
+  - `synthesis: str`, `key_findings: list[str]`, `markdown_report: str`, `structured_report: dict`
+  - `report_title: str`, `confidence: float`, `confidence_breakdown: dict`, `llm_quality_score: float`
+  - `citations: list[dict]`, `sources_analyzed: int`, `source_breakdown: dict`, `credibility_summary: dict`
+  - `claim_clusters: list`, `verified_claims: list`, `information_gaps: list`
+  - `refinement_rounds: int`, `session_id: str`, `total_duration_seconds: float`
+  - `tool_usage: dict`, `tool_insights: list`, `hybrid_mode: bool`, `model_tier: str`
 
-#### T3.6 — Implement class-level metadata and step_prompts for ResearchAgent
+#### T3.6 — Implement class-level metadata and step_prompts for DeepResearcher
 
-- File: `dopeagents/agents/research_agent.py`
-- Declare `step_prompts` for 6 steps (DD §17.2):
-  - `formulate`: decompose the research question into 3–5 focused sub-queries (model strategy: Smart gpt-4o)
-  - `search`: for each sub-query, produce candidate source titles, URLs, and relevance notes (model strategy: Fast/cheap + Tool)
-  - `evaluate`: score each source for credibility (0–1) and relevance (0–1) (model strategy: Smart gpt-4o)
-  - `synthesize`: write a draft report from the top-scored sources (model strategy: Smart gpt-4o)
-  - `fact_check`: cross-reference 3–5 key claims against multiple sources; flag inconsistencies (model strategy: Smart gpt-4o)
-  - `compose`: format the final report with inline citations and a confidence summary (model strategy: Fast/cheap gpt-4o-mini)
+- File: `dopeagents/agents/deep_researcher.py`
+- Declare `step_prompts` for LLM-driven steps; coded steps use no prompt (DD §17.2):
+  - `expand_query`: generate 3–5 refined search queries; determine search strategy ('academic', 'general', 'news', 'comprehensive')
+  - `deep_analysis`: extract claims from search sources; use bounded tool calls (fact_check, search_for_more, get_citations) — max `tool_budget` calls total
+  - `cross_reference`: analyze claim clusters for agreement, contradiction, and gaps across sources
+  - `synthesize`: write evidence-based synthesis with inline citations from verified sources
+  - `evaluate`: score quality/coverage/credibility/coherence (0–1 each); identify missing aspects
+  - `gap_analysis`: generate additional queries targeting identified information gaps (used in refine loop)
 
-#### T3.7 — Implement all 6 step methods
+#### T3.7 — Implement all 13 step methods
 
-- File: `dopeagents/agents/research_agent.py`
-- Each step calls `self._extract(response_model=_<Name>Out, messages=[...], model=self._model_for_step("<name>"))`
-- `_step_search`: simulates search by including sub-queries in the extraction prompt (real web search via `RESTTool` or `MCPTool` can be wired in later without changing the interface)
-- Constructor accepts optional `tools: list[Tool]` parameter for wiring real search tools
+- File: `dopeagents/agents/deep_researcher.py`
+- Coded steps call real APIs/utilities (no `_extract()`); LLM steps call `self._extract()`
+- `_step_load_context`: checks `ResearchMemory` for prior sessions on the same query
+- `_step_expand_query`: LLM — calls `_extract(_ExpandQueryOut)`; returns `expanded_queries`, `search_strategy`
+- `_step_real_search`: Code — searches Wikipedia, DuckDuckGo, Semantic Scholar, arXiv, CrossRef
+- `_step_extract_content`: Code — fetches and extracts readable text from each source URL
+- `_step_score_sources`: Code — credibility scoring via domain authority, citations, recency
+- `_step_deep_analysis`: LLM+TOOLS — uses `HybridStepRunner` with bounded tool calls (`ToolBudget`); extracts claims and insights
+- `_step_cross_reference`: LLM — calls `_extract(_CrossReferenceOut)`; clusters claims, finds agreements/contradictions
+- `_step_synthesize`: LLM — calls `_extract(_SynthesizeOut)`; evidence-based synthesis with citations
+- `_step_calculate_confidence`: Code — `ConfidenceCalculator` from measurable signals (coverage, credibility, citation density)
+- `_step_evaluate`: LLM — calls `_extract(_EvaluateOut)`; quality/coverage/credibility/coherence scoring
+- `_step_refine`: LLM — calls `_extract(_GapAnalysisOut)` then loops back to `real_search` with new queries
+- `_step_generate_report`: LLM+Code — `ReportGenerator` produces markdown, HTML, JSON, or executive summary
+- `_step_save_session`: Code — persists `ResearchSession` via `ResearchMemory`
 
-#### T3.8 — Implement `_build_graph()` for ResearchAgent
+#### T3.8 — Implement `_build_graph()` for DeepResearcher
 
-- File: `dopeagents/agents/research_agent.py`
-- Wire linear graph: `formulate → search → evaluate → synthesize → fact_check → compose → END`
-- Override `_has_loops()` → `False`
+- File: `dopeagents/agents/deep_researcher.py`
+- Wire graph: `load_context → expand_query → real_search → extract_content → score_sources → deep_analysis → cross_reference → synthesize → calculate_confidence → evaluate → (conditional) → refine → real_search (loop) | generate_report → save_session → END`
+- Conditional edge from `evaluate`: if `quality_score < quality_threshold AND refinement_rounds < max_refinement_loops`, go to `refine`; else go to `generate_report`
+- `refine` loops back to `real_search` (not `evaluate`) to fetch new sources for identified gaps
+- Override `_has_loops()` → `True`
 
-#### T3.9 — Implement `run()` for ResearchAgent
+#### T3.9 — Implement `run()` for DeepResearcher
 
-- File: `dopeagents/agents/research_agent.py`
-- Call `self._get_graph().invoke(initial_state)` and map final state to `ResearchOutput`
+- File: `dopeagents/agents/deep_researcher.py`
+- Build initial state from `DeepResearcherInput`; call `self._get_graph().invoke(initial_state)`
+- Map final state to `DeepResearcherOutput`; record `total_duration_seconds`
+- Lifecycle cooperation: `context = context or AgentContext()`, store on `_run_local.context`, re-raise `ExtractionProviderError`, wrap steps with `_step_span()`, budget-aware refinement via `_budget_config()`
 
 #### T3.10 — `dopeagents/contracts/types.py` — contract models
 
@@ -821,48 +849,53 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 #### T3.13 — Update `dopeagents/agents/__init__.py`
 
 - File: `dopeagents/agents/__init__.py`
-- Add exports: `ResearchAgent`, `ResearchInput`, `ResearchOutput`
+- Add exports: `DeepResearcher`, `DeepResearcherInput`, `DeepResearcherOutput`
 
 #### T3.14 — Update `dopeagents/__init__.py`
 
 - File: `dopeagents/__init__.py`
-- Add: `DeepSummarizer`, `DeepSummarizerInput`, `DeepSummarizerOutput`, `ResearchAgent`, `ResearchInput`, `ResearchOutput`
+- Add: `DeepSummarizer`, `DeepSummarizerInput`, `DeepSummarizerOutput`, `DeepResearcher`, `DeepResearcherInput`, `DeepResearcherOutput`
 
-> **Refinement note**: Also add the agent Input/Output types to root exports. `ContractChecker`, `Pipeline`, `SimpleRunner` should already be exported from T0.9 or Phase 2 work. Do not re-add items already present.
+> **Refinement note**: Also add the agent Input/Output types to root exports. `ContractChecker` and `Pipeline` should already be exported from prior work. Do not re-add items already present. `SimpleRunner` is a Phase 5 task (T5.12) — do not add it here.
 
 #### T3.15 — Contract and agent tests
 
-- Files: `tests/contracts/`, `tests/agents/test_research_agent.py`
+- Files: `tests/contracts/`, `tests/agents/test_deep_researcher.py`
 - `ContractChecker`: verify compatible pair passes, incompatible pair returns errors, optional field warning
 - `Pipeline`: verify `Pipeline([A, B])` raises at construction (not at runtime) when types mismatch
-- `ResearchAgent.describe().steps` == `["formulate", "search", "evaluate", "synthesize", "fact_check", "compose"]`
-- `ResearchAgent.describe().has_loops` is `False`
-- Integration: `Pipeline([DeepSummarizer, ResearchAgent])` raises `PipelineValidationError` (incompatible schemas — confirms the check is live)
+- `DeepResearcher.describe().steps` == `["load_context", "expand_query", "real_search", "extract_content", "score_sources", "deep_analysis", "cross_reference", "synthesize", "calculate_confidence", "evaluate", "refine", "generate_report", "save_session"]`
+- `DeepResearcher.describe().has_loops` is `True`
+- Integration: `Pipeline([DeepSummarizer, DeepResearcher])` raises `PipelineValidationError` (incompatible schemas — confirms the check is live)
 
 ---
 
 ### Definition of Done — Phase 3
 
-- [X] `ResearchAgent().run(ResearchInput(query="..."))` returns a valid `ResearchOutput` with a real LLM
-- [X] `ContractChecker.check(DeepSummarizer, ResearchAgent)` returns a `CompatibilityResult` with `compatible = False` and descriptive `errors`
-- [X] `Pipeline([DeepSummarizer, ResearchAgent])` raises `ValueError` at construction
+- [X] `DeepResearcher().run(DeepResearcherInput(query="..."))` returns a valid `DeepResearcherOutput` with a real LLM
+- [X] `ContractChecker.check(DeepSummarizer, DeepResearcher)` returns a `CompatibilityResult` with `compatible = False` and descriptive `errors`
+- [X] `Pipeline([DeepSummarizer, DeepResearcher])` raises `ValueError` at construction
 - [X] A `Pipeline` with two compatible agents (same output → input field names) validates and raises no errors
 - [X] `FunctionTool` implements both `input_type()` and `function_schema()`
-- [X] `mypy --strict dopeagents/agents/research_agent.py` exits 0
-- [X] ResearchAgent init-time `step_prompts` customization working (identical to DeepSummarizer pattern)
+- [X] `mypy --strict dopeagents/agents/deep_researcher.py` exits 0
+- [X] DeepResearcher init-time `step_prompts` customization working (identical to DeepSummarizer pattern)
 - [X] **38 comprehensive tests (12 ContractChecker + 10 Pipeline + 16 Composition integration)**
 
 **Status**: ✅ **COMPLETE** (Verified Mar 22, 2026)
 - **Completion**: All contract verification (T3.10–T3.12) and composition integration tests (T3.15) passing
 
 **Implementation Notes**:
-- ResearchAgent implements 6-step workflow: `expand_query → search → analyze → synthesize → evaluate → refine`
+- DeepResearcher is a 13-step hybrid agent in `dopeagents/agents/deep_researcher.py` (v3.1.0): `load_context → expand_query → real_search → extract_content → score_sources → deep_analysis → cross_reference → synthesize → calculate_confidence → evaluate → refine (loop) → generate_report → save_session`
+- Hybrid design: coded steps (search, extract, score, confidence, save) + LLM steps (expand, cross_reference, synthesize, evaluate, refine) + LLM+tools step (deep_analysis)
+- Real web search via Wikipedia, DuckDuckGo, Semantic Scholar, arXiv, CrossRef (requires `dopeagents[research]`)
+- Bounded tool calling via `ToolBudget` (max `tool_budget` calls per run, default 5)
 - Same `step_prompts` customization pattern as DeepSummarizer (init-time, instance-level)
 - Both agents consistently implement immutable `system_prompt` ClassVar + customizable `step_prompts`
-- ResearchAgent.describe().has_loops = True (evaluate↔refine loop)
+- DeepResearcher.describe().has_loops = True (evaluate→refine→real_search loop)
 - Contract system (ContractChecker, Pipeline) validates agent composition at construction time
 - Type compatibility supports exact match and allowed coercions (int→float, bool→int)
 - **Where Implemented**:
+  - [dopeagents/agents/deep_researcher.py](dopeagents/agents/deep_researcher.py) — 13-step hybrid agent (v3.1.0)
+  - [dopeagents/agents/_researcher/](dopeagents/agents/_researcher/) — Support modules (tools, memory, confidence, report_generator, etc.)
   - [dopeagents/contracts/types.py](dopeagents/contracts/types.py) — Type and contract models
   - [dopeagents/contracts/checker.py](dopeagents/contracts/checker.py) — Field mapping and compatibility validation
   - [dopeagents/contracts/pipeline.py](dopeagents/contracts/pipeline.py) — Sequential agent composition
@@ -876,7 +909,7 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 
 | Risk                                                                                                                                                   | Mitigation                                                                                                                                                       |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ResearchAgent needs real web search to be valuable —`_step_search` with only LLM simulation produces low-quality results                            | Clearly document that web search is a stub; expose a `tools: list[Tool]` parameter on `__init__` for wiring real search tools without changing the interface |
+| DeepResearcher requires `dopeagents[research]` extras for real web search (`trafilatura`, `beautifulsoup4`, `duckduckgo-search`) — without them, search steps return empty results | Document the `[research]` extras clearly; DuckDuckGo search is free and works without API keys; implement graceful degradation in search steps |
 | `ContractChecker` type compatibility is simplistic — Pydantic's type system (unions, generics, Annotated) is much richer than a dict of annotations | Start with exact match +`int → float` coercion; document that union types are unsupported and deferred to a later pass                                        |
 | `FunctionTool` doesn't implement `input_type()` from `Tool` ABC                                                                                  | Must generate a dynamic Pydantic model from the function's `inspect.signature()`                                                                               |
 
@@ -1029,9 +1062,9 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
   - Output coercion: if func returns `dict`, validate to `output_type`; if returns `str`, put in first field
 - Implement `wrap_class()`: instantiates `cls`, binds the method, delegates to `wrap_function()`
 
-#### T5.6 — `dopeagents/adapters/langgraph.py` — LangGraph adapter
+#### T5.6 — `dopeagents/adapters/langgraph_adapter.py` — LangGraph adapter
 
-- File: `dopeagents/adapters/langgraph.py`
+- File: `dopeagents/adapters/langgraph_adapter.py`
 - Implement `to_langgraph_node()` (DD §11.2):
   - Accepts `agent`, `input_mapping: dict[str, str] | None`, `output_mapping: dict[str, str] | None`, `context_factory: callable | None`
   - Returns a node function `(state: dict) → dict` suitable for LangGraph `StateGraph`
@@ -1043,21 +1076,21 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 
 > **Refinement note**: This task was missing from the original roadmap. DD §11.2 provides a complete reference implementation for converting DopeAgents agents into LangGraph node functions with state key mapping. This is critical for users who want to embed DopeAgents agents within their own LangGraph workflows.
 
-#### T5.7 — `dopeagents/adapters/langchain.py` — LangChain adapters
+#### T5.7 — `dopeagents/adapters/langchain_adapter.py` — LangChain adapters
 
-- File: `dopeagents/adapters/langchain.py`
+- File: `dopeagents/adapters/langchain_adapter.py`
 - Implement `to_langchain_runnable()` and `to_langchain_tool()` (DD §11.3)
 - Guard with `_check_installed()` → `FrameworkNotInstalledError`
 
-#### T5.8 — `dopeagents/adapters/crewai.py` — CrewAI adapter
+#### T5.8 — `dopeagents/adapters/crewai_adapter.py` — CrewAI adapter
 
-- File: `dopeagents/adapters/crewai.py`
+- File: `dopeagents/adapters/crewai_adapter.py`
 - Implement `to_crewai_tool()` (DD §11.4)
 - Guard with `_check_installed()`
 
-#### T5.9 — `dopeagents/adapters/autogen.py` — AutoGen adapter
+#### T5.9 — `dopeagents/adapters/autogen_adapter.py` — AutoGen adapter
 
-- File: `dopeagents/adapters/autogen.py`
+- File: `dopeagents/adapters/autogen_adapter.py`
 - Implement `to_autogen_function()` (DD §11.5) returning `{function, name, description, parameters}`
 - Guard with `_check_installed()`
 
@@ -1122,7 +1155,7 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 - Add all remaining exports per DD §18.1:
   ```python
   from dopeagents.agents.deep_summarizer import DeepSummarizer, DeepSummarizerInput, DeepSummarizerOutput
-  from dopeagents.agents.research_agent import ResearchAgent, ResearchInput, ResearchOutput
+  from dopeagents.agents.deep_researcher import DeepResearcher, DeepResearcherInput, DeepResearcherOutput
   from dopeagents.contracts.checker import ContractChecker
   from dopeagents.contracts.pipeline import Pipeline
   from dopeagents.adapters.simple import SimpleRunner
@@ -1133,7 +1166,7 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 
 - File: `README.md`
 - Must reflect what is actually implemented post-Phase 5
-- Sections: Installation, Quick Start (DeepSummarizer, ResearchAgent), MCP exposure, Sandbox CLI, Framework adapters, Configuration, Contributing
+- Sections: Installation, Quick Start (DeepSummarizer, DeepResearcher), MCP exposure, Sandbox CLI, Framework adapters, Configuration, Contributing
 - All import paths use `dopeagents.*` (not `agentmaker.*`)
 
 #### T5.21 — CLI & sandbox tests
@@ -1149,7 +1182,7 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 #### T5.22 — `pip install dopeagents` smoke test
 
 - File: `tests/test_smoke.py`
-- `from dopeagents import Agent, DeepSummarizer, ResearchAgent, ContractChecker, Pipeline, SimpleRunner, Registry, register`
+- `from dopeagents import Agent, DeepSummarizer, DeepResearcher, ContractChecker, Pipeline, SimpleRunner, Registry, register`
 - `DeepSummarizer().describe()` works without an API key
 - `AgentExecutor` is importable from `dopeagents.lifecycle`
 - CLI entry point: `dopeagents --help` exits 0
@@ -1160,7 +1193,7 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3
 
 - [ ] `pip install .` succeeds cleanly
 - [ ] `dopeagents --help` and `dopeagents sandbox --help` display correctly
-- [ ] `dopeagents sandbox list` lists DeepSummarizer and ResearchAgent
+- [ ] `dopeagents sandbox list` lists DeepSummarizer and DeepResearcher
 - [ ] `dopeagents sandbox dry-run DeepSummarizer --input '{"text": "hello"}'` outputs prompt preview with "NO API CALL MADE"
 - [ ] `dopeagents mcp serve --transport stdio` starts and prints the MCP schema handshake
 - [ ] `wrap_function()` produces an Agent that passes `SpecValidator.validate()`

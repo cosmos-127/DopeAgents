@@ -8,12 +8,54 @@
 
 - **Typed Interfaces**: Full type hints and Pydantic-based validation for type-safe agent interactions
 - **Multi-step Workflows**: Sophisticated orchestration using LangGraph for complex agent behaviors
-- **Cost Tracking**: Per-step and global cost monitoring to manage API spending
-- **Observability**: Built-in tracing, metrics collection, and debug logging
-- **Error Handling**: Comprehensive error hierarchy and resilience patterns
-- **Configuration Management**: Environment-based configuration with sensible defaults
-- **Colored Logging**: Rich, environment-aware logging (colors in dev, plain text in production)
+  - DeepSummarizer: 7-step document summarization with iterative refinement
+  - DeepResearcher: 13-step research with real search APIs and bounded tool calling
+- **Real Search Integration**: Actual free API search (Wikipedia, DuckDuckGo, Semantic Scholar, arXiv, CrossRef) instead of hallucinations
+- **Hybrid Pipeline Architecture**: Combination of deterministic code steps with adaptive LLM-based analysis and bounded tool calling
+- **Cost Tracking**: Per-step and global cost monitoring with budget enforcement (error or graceful degradation)
+- **Observability**: Structured logging, tracing, step-level metrics collection, and debug information
+- **Error Handling**: Comprehensive, typed error hierarchy with JSON serialization for structured error handling
+- **Configuration Management**: Environment-based configuration with auto-detection of LLM providers and sensible defaults
+- **Colored Logging**: Rich, environment-aware logging (ANSI colors in development, plain text in production)
 - **Extensible Architecture**: Modular design for custom adapters, tools, and caching backends
+- **Research Memory**: Session persistence and context loading for DeepResearcher follow-up queries
+- **Credibility Scoring**: Evidence-based confidence calculation from measurable signals (domain authority, citations, recency)
+
+## Built-in Agents
+
+DopeAgents includes production-ready multi-step agents:
+
+### DeepSummarizer
+A 7-step summarization agent with self-evaluation and iterative refinement:
+- Text structure analysis and chunk size heuristic (code)
+- Document chunking into cost-bounded chunks (code)
+- Chunk summarization (LLM)
+- Synthesis of chunk summaries (LLM)
+- Quality evaluation with faithfulness, completeness, coherence scoring (LLM)
+- Iterative refinement loop (LLM)
+- Output formatting and style application (code)
+
+Features configurable summary styles (paragraph, bullets, tldr) and optional focus areas.
+
+### DeepResearcher
+A 13-step hybrid research agent with code-controlled pipeline and bounded LLM tool calling:
+- Context loading from previous research sessions (code)
+- Query expansion and strategy determination (LLM)
+- Real search across Wikipedia, DuckDuckGo, Semantic Scholar, arXiv, CrossRef (code)
+- Content extraction from source URLs (code)
+- Credibility scoring via domain authority, citations, recency (code)
+- Deep analysis with bounded tool calling for fact-checking and citations (LLM + tools)
+- Cross-referencing claims for agreement/contradiction (LLM)
+- Evidence-based synthesis with citations (LLM)
+- Grounded confidence calculation from measurable signals (code)
+- Quality evaluation and gap detection (LLM)
+- Targeted gap-filling refinement (LLM + code)
+- Structured report generation in multiple formats (LLM + code)
+- Session persistence for follow-up queries (code)
+
+Note: DeepResearcher is implemented but not yet exported from the top-level package API.
+
+Both agents are fully typed, extensively tested, and ready for production use.
 
 ## Quick Start
 
@@ -27,7 +69,7 @@ uv pip install dopeagents
 pip install dopeagents
 ```
 
-**Requires Python 3.11+**
+**Requires Python 3.12+**
 
 ### Basic Usage
 
@@ -99,58 +141,97 @@ logger.warning("Warning message")
 logger.error("Error occurred")
 ```
 
-## Project Structure
+### Project Structure
 
 ```
 dopeagents/
-├── core/              # Core agent interface and types
-├── config.py          # Configuration management
-├── observability/     # Logging, tracing, metrics
-├── adapters/          # LLM provider integrations
-├── agents/            # Agent implementations
-├── tools/             # Tool definitions and execution
-├── cache/             # Caching backends
-├── cost/              # Cost tracking
-├── errors.py          # Error hierarchy
-└── __init__.py        # Public API
+├── core/                  # Agent base class and core types
+├── agents/                # Concrete agent implementations
+│   ├── deep_summarizer.py # 7-step summarization agent
+│   ├── deep_researcher.py # 13-step research agent
+│   ├── _summarizer/       # DeepSummarizer internals
+│   └── _researcher/       # DeepResearcher internals
+├── agent_utils/           # Shared utilities (search, extraction, credibility, etc.)
+├── config.py              # Configuration management (environment-based)
+├── observability/         # Logging, tracing, metrics, instrumentation
+├── adapters/              # LLM provider integrations (LiteLLM, LangGraph)
+├── tools/                 # Tool definitions and execution
+├── cache/                 # Caching backends (memory, disk)
+├── cost/                  # Cost tracking and budget management
+├── errors.py              # Structured error hierarchy
+└── __init__.py            # Public API exports
 ```
 
 ## Key Components
 
-### Agent
-
-The core abstraction for building AI workflows:
+### Agent Execution Example
 
 ```python
-from dopeagents import Agent
+from dopeagents import DeepSummarizer, get_logger, AgentResult, ExecutionMetrics
+from dopeagents.agents import DeepSummarizerInput
 
-agent = Agent(
-    name="research_agent",
-    description="Researches topics and extracts key insights",
-    # ... configuration
+logger = get_logger(__name__)
+
+# Initialize the summarizer
+summarizer = DeepSummarizer()
+
+# Run the 7-step summarization workflow
+result: AgentResult[DeepSummarizerOutput] = summarizer.run(
+    DeepSummarizerInput(
+        text="Your long document text here...",
+        max_length=500,
+        style="bullets",
+        focus="key insights",
+        quality_threshold=0.8,
+        max_refinement_loops=3
+    )
 )
 
-result = agent.run(input_data={...})
+if result.success:
+    output = result.output
+    logger.info(f"Summary: {output.summary}")
+    logger.info(f"Key Points: {output.key_points}")
+    logger.info(f"Quality Score: {output.quality_score}")
+    logger.info(f"Refinement Rounds: {output.refinement_rounds}")
+    logger.info(f"Chunks Processed: {output.chunks_processed}")
+    logger.info(f"Tokens Used: {output.total_tokens_used}")
+    
+    # Access metrics for cost tracking
+    if result.metrics:
+        logger.info(f"Total Cost: ${result.metrics.total_cost:.4f}")
+else:
+    logger.error(f"Agent failed: {result.error}")
 ```
 
-### Configuration
+### Global Configuration
 
-Global configuration management:
+Global configuration management with environment auto-detection:
 
 ```python
 from dopeagents import get_config, set_config, DopeAgentsConfig
 
 # Get the global config
 config = get_config()
+model = config.default_model
+cost_tracking_enabled = config.enable_cost_tracking
 
 # Or create and set custom config
 custom_config = DopeAgentsConfig(
-    default_model="gpt-4-turbo",
+    default_model="openrouter/meta-llama/llama-3.3-70b-instruct:free",
     enable_cost_tracking=True,
-    max_retries=5
+    max_cost_per_call=10.00,
+    max_retries=3,
+    log_level="DEBUG"
 )
 set_config(custom_config)
 ```
+
+Configuration reading order:
+1. Explicit environment variables (e.g., `GROQ_API_KEY`, `NVIDIA_NIM_API_KEY`)
+2. `DOPEAGENTS_*` prefixed environment variables
+3. Defaults from `DopeAgentsConfig`
+
+The framework auto-detects the active provider based on available API keys.
 
 ### Logging
 
@@ -239,14 +320,32 @@ isort dopeagents
 DopeAgents provides optional integrations for extended functionality:
 
 ```bash
+# Research capabilities (content extraction, web search)
+uv pip install dopeagents[research]
+
+# Disk-based caching
+uv pip install dopeagents[cache]
+
 # OpenTelemetry observability
 uv pip install dopeagents[otel]
 
 # Model Context Protocol (MCP) server
 uv pip install dopeagents[mcp]
 
+# LangChain integration
+uv pip install dopeagents[langchain]
+
+# CrewAI integration
+uv pip install dopeagents[crewai]
+
 # AutoGen integration
 uv pip install dopeagents[autogen]
+
+# OpenAI provider
+uv pip install dopeagents[providers]
+
+# All optional dependencies
+uv pip install dopeagents[all]
 ```
 
 ## Architecture Highlights

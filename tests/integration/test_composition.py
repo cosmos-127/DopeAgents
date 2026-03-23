@@ -1,44 +1,56 @@
 """Integration tests for agent composition and contracts — Phase 3 validation.
 
 Tests that:
-1. ResearchAgent implements all 6 steps correctly
-2. ResearchAgent.describe() returns correct step list and has_loops=False
-3. DeepSummarizer and ResearchAgent are incompatible (different output/input schemas)
+1. DeepResearcher implements all 6 steps correctly
+2. DeepResearcher.describe() returns correct step list and has_loops=False
+3. DeepSummarizer and DeepResearcher are incompatible (different output/input schemas)
 4. Pipeline validation detects incompatibility at construction
 5. Compatible agent pairs can be composed successfully
 """
 
 import pytest
 
-from dopeagents.agents import DeepSummarizer, ResearchAgent, ResearchAgentInput
+from dopeagents.agents import (
+    DeepResearcher,
+    DeepResearcherInput,
+    DeepSummarizer,
+    DeepSummarizerOutput,
+)
 from dopeagents.contracts.checker import ContractChecker
 from dopeagents.contracts.pipeline import Pipeline
 
 
-class TestResearchAgentStructure:
-    """Test ResearchAgent workflow structure."""
+class TestDeepResearcherStructure:
+    """Test DeepResearcher workflow structure."""
 
     def test_research_agent_steps(self) -> None:
-        """Test ResearchAgent has all 6 expected steps."""
-        agent = ResearchAgent()
+        """Test DeepResearcher has all expected step prompts."""
+        agent = DeepResearcher()
         desc = agent.describe()
 
-        expected_steps = ["expand_query", "search", "analyze", "synthesize", "evaluate", "refine"]
+        expected_steps = [
+            "expand_query",
+            "extract_claims",
+            "cross_reference",
+            "synthesize",
+            "evaluate",
+            "gap_analysis",
+        ]
 
         assert desc.steps == expected_steps, f"Expected steps {expected_steps}, got {desc.steps}"
 
     def test_research_agent_has_loops(self) -> None:
-        """Test ResearchAgent has loops (evaluate → refine loop)."""
-        agent = ResearchAgent()
+        """Test DeepResearcher has loops (evaluate → refine loop)."""
+        agent = DeepResearcher()
         desc = agent.describe()
 
         assert (
             desc.has_loops is True
-        ), "ResearchAgent should have has_loops=True due to evaluate→refine loop"
+        ), "DeepResearcher should have has_loops=True due to evaluate→refine loop"
 
     def test_research_agent_step_prompts_complete(self) -> None:
         """Test all 6 steps have prompts."""
-        agent = ResearchAgent()
+        agent = DeepResearcher()
         desc = agent.describe()
 
         for step in desc.steps:
@@ -46,26 +58,26 @@ class TestResearchAgentStructure:
             assert len(agent.step_prompts[step]) > 0, f"Step '{step}' prompt is empty"
 
     def test_research_agent_init_time_step_prompts_customization(self) -> None:
-        """Test ResearchAgent init-time step_prompts customization."""
+        """Test DeepResearcher init-time step_prompts customization."""
         custom_prompts = {
             "expand_query": "Custom expansion strategy...",
-            "search": "Custom search strategy...",
+            "synthesize": "Custom synthesis strategy...",
         }
 
-        agent = ResearchAgent(step_prompts=custom_prompts)
+        agent = DeepResearcher(step_prompts=custom_prompts)
 
         # Custom prompts should override defaults
         assert agent.step_prompts["expand_query"] == custom_prompts["expand_query"]
-        assert agent.step_prompts["search"] == custom_prompts["search"]
+        assert agent.step_prompts["synthesize"] == custom_prompts["synthesize"]
 
         # Other steps should still have defaults
-        assert len(agent.step_prompts["analyze"]) > 0
-        assert "Custom" not in agent.step_prompts["analyze"]
+        assert len(agent.step_prompts["evaluate"]) > 0
+        assert "Custom" not in agent.step_prompts["evaluate"]
 
     def test_research_agent_instance_independence(self) -> None:
         """Test instances with different step_prompts are independent."""
-        agent1 = ResearchAgent()
-        agent2 = ResearchAgent(step_prompts={"expand_query": "Custom for agent2"})
+        agent1 = DeepResearcher()
+        agent2 = DeepResearcher(step_prompts={"expand_query": "Custom for agent2"})
 
         # agent1 should still have default
         assert "Custom" not in agent1.step_prompts["expand_query"]
@@ -77,14 +89,14 @@ class TestAgentCompositionCompatibility:
     """Test compatibility checking and composition."""
 
     def test_deep_summarizer_research_agent_incompatible(self) -> None:
-        """Test DeepSummarizer and ResearchAgent are incompatible."""
+        """Test DeepSummarizer and DeepResearcher are incompatible."""
         summarizer = DeepSummarizer()
-        researcher = ResearchAgent()
+        researcher = DeepResearcher()
 
         result = ContractChecker.check(summarizer, researcher)
 
         assert result.compatible is False, (
-            "DeepSummarizer and ResearchAgent should be incompatible "
+            "DeepSummarizer and DeepResearcher should be incompatible "
             "(different output/input schemas)"
         )
         assert len(result.errors) > 0, "Should have errors explaining incompatibility"
@@ -92,7 +104,7 @@ class TestAgentCompositionCompatibility:
     def test_incompatibility_errors_descriptive(self) -> None:
         """Test incompatibility errors are descriptive."""
         summarizer = DeepSummarizer()
-        researcher = ResearchAgent()
+        researcher = DeepResearcher()
 
         result = ContractChecker.check(summarizer, researcher)
 
@@ -144,9 +156,9 @@ class TestPipelineCompositionValidation:
     """Test Pipeline validates composition at construction."""
 
     def test_pipeline_deep_summarizer_research_agent_fails(self) -> None:
-        """Test Pipeline([DeepSummarizer, ResearchAgent]) raises at construction."""
+        """Test Pipeline([DeepSummarizer, DeepResearcher]) raises at construction."""
         summarizer = DeepSummarizer()
-        researcher = ResearchAgent()
+        researcher = DeepResearcher()
 
         with pytest.raises(ValueError) as exc_info:
             Pipeline(name="IncompatibleComposition", agents=[summarizer, researcher])
@@ -232,7 +244,6 @@ class TestContractCheckerFieldDecomposition:
 
     def test_checker_identifies_output_fields(self) -> None:
         """Test ContractChecker correctly identifies output fields."""
-        from dopeagents.agents import DeepSummarizerOutput
 
         fields = ContractChecker._extract_fields(DeepSummarizerOutput)
 
@@ -243,7 +254,7 @@ class TestContractCheckerFieldDecomposition:
     def test_checker_identifies_input_fields(self) -> None:
         """Test ContractChecker correctly identifies input fields."""
 
-        fields = ContractChecker._extract_fields(ResearchAgentInput)
+        fields = ContractChecker._extract_fields(DeepResearcherInput)
 
         assert "query" in fields
         assert "research_focus" in fields or "quality_threshold" in fields
@@ -252,10 +263,9 @@ class TestContractCheckerFieldDecomposition:
 
     def test_output_input_field_mismatch(self) -> None:
         """Test ContractChecker detects field name mismatches."""
-        from dopeagents.agents import DeepSummarizerOutput
 
         summary_fields = ContractChecker._extract_fields(DeepSummarizerOutput)
-        research_fields = ContractChecker._extract_fields(ResearchAgentInput)
+        research_fields = ContractChecker._extract_fields(DeepResearcherInput)
 
         # No overlap between DeepSummarizerOutput and ResearchInput field names
         summary_names = set(summary_fields.keys())

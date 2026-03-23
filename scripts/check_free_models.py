@@ -8,6 +8,7 @@ Calls each provider's /models endpoint directly (no LiteLLM) and filters
 for free-tier models. Only runs for providers whose API key is set in .env.
 
 Provider endpoints:
+  NVIDIA NIM  — GET https://integrate.api.nvidia.com/v1/models (auth required)
   Groq        — GET https://api.groq.com/openai/v1/models       (all models are free-tier)
   OpenRouter  — GET https://openrouter.ai/api/v1/models          (no auth; filter price==0)
   Together AI — GET https://api.together.xyz/v1/models           (filter input_price==0)
@@ -43,6 +44,23 @@ def _get(url: str, api_key: str | None = None, timeout: int = 15) -> list[dict[s
     except Exception as e:
         print(f"      Error: {e}")
         return None
+
+
+# ── NVIDIA NIM ────────────────────────────────────────────────────────────────
+# OpenAI-compatible endpoint. Requires auth; lists available models.
+def list_nvidia_nim(api_key: str, api_base: str | None) -> None:
+    if not api_base:
+        print("\n  ⚪  NVIDIA NIM — API base URL not configured, skipping")
+        return
+    masked = api_key[:8] + "..." + api_key[-4:]
+    print(f"\n  🔑  NVIDIA NIM ({masked})")
+    models = _get(f"{api_base}/models", api_key)
+    if models is None:
+        return
+    chat_models = [m for m in models if m.get("object") == "model"]
+    print(f"      {len(chat_models)} models available:\n")
+    for m in sorted(chat_models, key=lambda x: x.get("id", "")):
+        print(f"        • {m['id']}")
 
 
 # ── Groq ─────────────────────────────────────────────────────────────────────
@@ -88,13 +106,6 @@ def list_together(api_key: str) -> None:
     for m in sorted(free, key=lambda x: x.get("id", "")):
         mtype = m.get("type", "")
         print(f"        • {m['id']:<60}  [{mtype}]")
-    if not free:
-        # fallback: show all and note pricing unknown
-        print("      (no models with input_price=0 found — showing all chat models)")
-        chat = [m for m in models if "chat" in m.get("type", "").lower()][:15]
-        for m in chat:
-            price = m.get("pricing", {}).get("input", "?")
-            print(f"        • {m['id']:<60}  input=${price}/M")
 
 
 def main() -> None:
@@ -104,6 +115,11 @@ def main() -> None:
     print("  DopeAgents — Free Model Listing (live REST API calls)")
     print("=" * 70)
     print(f"  Active model (resolve_model): {config.resolve_model()}")
+
+    if config.nvidia_nim_api_key:
+        list_nvidia_nim(config.nvidia_nim_api_key, config.nvidia_nim_api_base)
+    else:
+        print("\n  ⚪  NVIDIA NIM — NVIDIA_NIM_API_KEY not set, skipping")
 
     if config.groq_api_key:
         list_groq(config.groq_api_key)
@@ -119,6 +135,7 @@ def main() -> None:
 
     print("\n" + "=" * 70)
     print("  Tip: uncomment the key you want in .env to switch active provider.")
+    print("  Provider priority: NVIDIA NIM > Groq > OpenRouter > Together AI")
     print("=" * 70)
 
 

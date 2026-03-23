@@ -1,17 +1,21 @@
 """Concrete agent implementations."""
 
+from dopeagents.agents.deep_researcher import (
+    DeepResearcher,
+    DeepResearcherInput,
+    DeepResearcherOutput,
+)
 from dopeagents.agents.deep_summarizer import (
     DeepSummarizer,
     DeepSummarizerInput,
     DeepSummarizerOutput,
 )
-from dopeagents.agents.research_agent import ResearchAgent, ResearchAgentInput, ResearchAgentOutput
 
 __all__ = [
+    "DeepResearcher",
+    "DeepResearcherInput",
+    "DeepResearcherOutput",
     "DeepSummarizer",
     "DeepSummarizerInput",
     "DeepSummarizerOutput",
-    "ResearchAgent",
-    "ResearchAgentInput",
-    "ResearchAgentOutput",
 ]

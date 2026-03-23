@@ -9,7 +9,7 @@
 >
 > This document describes both the **target architecture** for DopeAgents v0.1.0 and the current implementation state. It is a normative design spec **and** an accurate record of what is built.
 >
-> As of the current repository state, Phase 1 core infrastructure is complete. The [Development Roadmap (§22)](#22-development-roadmap) tracks what is implemented (`●`), scaffolded (`◐`), or not yet started (`○`).
+> As of the current repository state, Phase 1 and Phase 2 core infrastructure are complete. The [Development Roadmap (§22)](#22-development-roadmap) tracks what is implemented (`●`), scaffolded (`◐`), or not yet started (`○`).
 >
 > For implemented modules, code examples reflect the actual working implementation. For stub modules, code examples show the target reference implementation that should be built.
 
@@ -224,27 +224,37 @@ P12: Protocol-native by default
 
 ```text
 dopeagents (core) — always installed
-├── pydantic >= 2.11
+├── pydantic >= 2.12
+├── pydantic-settings >= 2.12  # environment variable configuration
 ├── instructor >= 1.14         # structured extraction + validation retries
-├── litellm >= 1.56            # provider routing + token/cost accounting
-├── langgraph >= 0.2           # internal graph orchestration (core dep)
+├── litellm >= 1.80            # provider routing + token/cost accounting
+├── langgraph >= 1.1.3, < 2.0  # internal graph orchestration (core dep)
+├── python-dotenv >= 1.0       # .env file support
+├── packaging >= 21.0          # version handling
 ├── typing-extensions >= 4.12
 ├── click >= 8.1
 ├── jsonschema >= 4.23
-└── httpx >= 0.27
+├── httpx >= 0.27
+└── rich >= 13.0               # colored terminal output
 
 dopeagents[mcp]                # MCP exposure
-└── fastmcp >= 3.0
+└── fastmcp >= 3.0, < 4.0
 
 dopeagents[cache]              # optional
 └── diskcache >= 5.6
 
+dopeagents[research]           # optional — real search APIs for DeepResearcher
+├── trafilatura >= 1.8
+├── beautifulsoup4 >= 4.12
+└── duckduckgo-search >= 5.0
+
 dopeagents[otel]               # optional
-├── opentelemetry-api >= 1.28
-└── opentelemetry-sdk >= 1.28
+├── opentelemetry-api >= 1.20
+├── opentelemetry-sdk >= 1.20
+└── opentelemetry-exporter-otlp >= 0.41b0
 
 dopeagents[langchain]          # optional — for .as_langchain_runnable()
-└── langchain-core >= 1.0
+└── langchain >= 0.1
 
 dopeagents[crewai]             # optional — for .as_crewai_tool()
 └── crewai >= 1.0
@@ -254,6 +264,161 @@ dopeagents[autogen]            # optional — for .as_autogen_function()
 ```
 
 **Note:** `langgraph` is a **core dependency** — it powers the internal graphs of every multi-step agent. This is different from framework adapters (LangChain, CrewAI, AutoGen), which remain optional. LangGraph is used internally, not surfaced to callers.
+
+### 2.2.1 Instructor: Structured Extraction Modes and Patterns
+
+> 📄 **Role:** Handles all LLM → structured data extraction via `Agent._extract(response_model, messages)`. Operates invisibly to agent authors and users. This subsection explains the two extraction modes and the prompt patterns required for each.
+
+**Why Instructor?** LLMs generate text. But agents need **structured, validated output** — Pydantic models with field constraints, type validation, and retry logic when validation fails. Instructor bridges this gap: you pass a Pydantic model (`response_model=MyOutput`) and it ensures the LLM returns an instance of that model, validated and ready to use.
+
+**How it works:** Instructor works **automatically** in two modes, selected based on model capabilities. You don't choose the mode — it's determined by `litellm.supports_function_calling(model)`:
+
+#### Mode 1: TOOLS (Function Calling) — Primary Path
+
+**When:** Model supports function calling (OpenAI, Anthropic Claude, Groq, etc. — most providers)
+
+**How it works:**
+1. You call `self._extract(response_model=MyOutput, messages=[...])`
+2. Instructor converts `MyOutput` (your Pydantic model) into a **tool definition** with the schema embedded
+3. LLM receives the tool definition alongside your natural-language prompt
+4. LLM **returns a tool call** (not text JSON) with the structured arguments
+5. Instructor validates the tool arguments against the Pydantic model and returns an `MyOutput` instance
+
+**Prompt pattern (CORRECT):**
+```python
+# Natural language only — Instructor handles the schema enforcement
+messages = [
+    {"role": "system", "content": "You are a summarization expert."},
+    {"role": "user", "content": "Summarize this text concisely."},
+]
+result = self._extract(response_model=SummaryOutput, messages=messages)
+# Result is validated SummaryOutput instance
+```
+
+**What NOT to do:**
+```python
+# ❌ WRONG — Don't tell the model to return JSON
+messages = [
+    {"role": "system", "content": "You are a summarization expert."},
+    {"role": "user", "content": "Summarize this text. RETURN ONLY THIS JSON: {\"summary\": \"text\"}"},
+]
+# The model sees both:
+#  1. The tool call instruction (from Instructor)
+#  2. Your "RETURN JSON" instruction (from the prompt)
+# This causes the model to emit JSON in the text response ALONGSIDE the tool call,
+# breaking Instructor's parsing.
+```
+
+#### Mode 2: MD_JSON (Markdown JSON) — Fallback
+
+**When:** Model does NOT support function calling (some open-source models, edge providers)
+
+**How it works:**
+1. You call `self._extract(response_model=MyOutput, messages=[...])`
+2. Instructor injects a JSON schema hint into the system prompt (transparently)
+3. LLM generates a text response containing JSON in a markdown code block (```json ... ```)
+4. Instructor **automatically parses the markdown code block** and validates the JSON
+5. Returns a validated `MyOutput` instance
+
+**Prompt pattern (CORRECT):** Same as TOOLS mode
+
+```python
+messages = [
+    {"role": "system", "content": "You are a summarization expert."},
+    {"role": "user", "content": "Summarize this text concisely."},
+]
+result = self._extract(response_model=SummaryOutput, messages=messages)
+# Instructor auto-injects JSON schema hint and parses the markdown block
+# Result is validated SummaryOutput instance
+```
+
+**Automatic fallback:** If you set `force_json_mode=True` explicitly, it forces MD_JSON mode even for models that support function calling (useful for testing or edge cases).
+
+#### Key Design Point: Prompts NEVER Prescribe Format
+
+Instructor's core value is **invisible schema enforcement**. Writing natural-language prompts and letting Instructor handle the structure is the correct pattern:
+
+| Approach | Code | Outcome | When to use |
+|---|---|---|---|
+| **Natural language (Instructor)** | `"Summarize this text."` | Instructor injects schema / tool def → LLM respects it automatically | Always — this is the right way |
+| **Prescriptive JSON (WRONG)** | `"Return this JSON: {\"field\": \"value\"}"` | LLM sees conflicting instructions (tool def + JSON format) → parsing breaks, fallback fails | Never — destroys Instructor's design |
+
+**Real example — DeepSummarizer's `evaluate` step:**
+
+```python
+# ✅ CORRECT: Natural language, Instructor enforces structure
+
+class EvaluateOut(BaseModel):
+    faithfulness_score: float = Field(ge=0.0, le=1.0)
+    completeness_score: float = Field(ge=0.0, le=1.0)
+    coherence_score: float = Field(ge=0.0, le=1.0)
+    quality_score: float = Field(ge=0.0, le=1.0)
+    feedback: str
+    unsupported_claims: list[str]
+
+out = self._extract(
+    response_model=EvaluateOut,
+    messages=[
+        {
+            "role": "system",
+            "content": "You are an expert evaluator."
+        },
+        {
+            "role": "user",
+            "content": (
+                "Score this summary on:\n"
+                "- Faithfulness: every claim grounded in source\n"
+                "- Completeness: all key points covered\n"
+                "- Coherence: clear and well-structured\n"
+                "Return scores 0.0–1.0 and specific feedback."
+            )
+        }
+    ],
+    model=self._model_for_step("evaluate"),
+)
+# Return type: validated EvaluateOut instance
+```
+
+**Why this works:** Instructor sees the `EvaluateOut` schema and sends it to the LLM (either as a tool def or embedded JSON schema hint, depending on mode). The LLM knows the exact fields and types required, and returns structured data. No cleanup, no parsing, no JSON-in-markdown detection code. Just pure structured extraction.
+
+**Real example — DeepResearcher's `synthesize` step:**
+
+```python
+# ✅ CORRECT: Same pattern adopted across all agents
+
+class SynthesizeOut(BaseModel):
+    synthesis: str = Field(description="Evidence-based synthesis")
+    key_findings: list[str] = Field(description="Top 3-5 key findings")
+    citations: list[dict[str, str]] = Field(
+        default_factory=list,
+        description="Citations: {claim, source_title, url}",
+    )
+
+out = self._extract(
+    response_model=SynthesizeOut,
+    messages=[
+        {
+            "role": "system",
+            "content": self.system_prompt  # "You are an expert research analyst..."
+        },
+        {
+            "role": "user",
+            "content": (
+                f"{self.step_prompts['synthesize']}\n\n"  # Task guidance from ClassVar
+                f"Research query: {query}\n\n"
+                f"## Available Sources:\n{sources}\n\n"
+                f"## Claim Analysis:\n{claims}"
+            )
+        }
+    ],
+    model=self._model_for_step("synthesize"),
+)
+# Return type: validated SynthesizeOut instance with proper citations
+```
+
+**Pattern consistency:** Both DeepSummarizer and DeepResearcher (and all future agents) follow the same schema-driven approach — natural language prompts, transparent Instructor schema injection, zero manual JSON handling.
+
+---
 
 ### 2.3 Design Invariants
 
@@ -281,62 +446,86 @@ These must never be violated:
 ```python
 # dopeagents/core/agent.py
 
+from __future__ import annotations
+
+import threading
 from abc import ABC, abstractmethod
-from typing import TypeVar, Generic, ClassVar, get_args, get_origin
-from pydantic import BaseModel
+from collections.abc import Callable
+from typing import Any, ClassVar, Generic, TypeVar, cast, get_args, get_origin
+
+from pydantic import BaseModel, Field
+
+from dopeagents.config import get_config
 from dopeagents.core.context import AgentContext
 from dopeagents.core.metadata import AgentMetadata
+from dopeagents.core.types import AgentResult
 
 InputT = TypeVar("InputT", bound=BaseModel)
 OutputT = TypeVar("OutputT", bound=BaseModel)
 
 
+class DebugInfo(BaseModel):
+    """Complete transparency into what an agent will do with a given input.
+
+    Returned by agent.debug(input) without making any LLM calls.
+    Contains the graph structure, step prompts, and response schemas.
+    """
+    is_multi_step: bool = Field(default=False)
+    graph_topology: dict[str, Any] | None = Field(default=None)
+    step_prompts: dict[str, str] = Field(default_factory=dict)
+    step_schemas: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    system_prompt: str = Field(default="")
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentDescription(BaseModel):
+    """Structured description of an agent — its steps, loop structure, and model assignments.
+
+    Returned by agent.describe() and used in discovery/composition.
+    """
+    name: str
+    version: str
+    description: str
+    is_multi_step: bool = Field(default=False)
+    steps: list[str] = Field(default_factory=list)  # Ordered step names (empty for single-step)
+    has_loops: bool = Field(default=False)
+    capabilities: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    requires_llm: bool = Field(default=True)
+    default_model: str | None = None  # class-level default, not instance override
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+
+
 class Agent(ABC, Generic[InputT, OutputT]):
     """Base class for all DopeAgents.
-    
-    The run() method is @abstractmethod — every concrete agent must implement it.
-    Framework adapters and the lifecycle layer (AgentExecutor) use run(input) → AgentResult
-    as the canonical interface, regardless of which framework calls the agent.
-    """
-    """
-    Base class for all DopeAgents agents.
 
-    Every agent is a typed, stateless function: InputT → OutputT
+    Agents are generic over InputT and OutputT (Pydantic models).
+    Concrete agents specialize this base class with specific input/output types.
 
-    Single-step agents implement run() directly using self._extract().
-    Multi-step agents implement _build_graph() to define an internal LangGraph
-    workflow — and let the compiled graph drive run() automatically.
-
-    The lifecycle layer handles observability, cost, retry, and caching.
-    Framework and protocol adapters are inherited — never written per agent.
-    LangGraph is an internal engine; callers never interact with it.
+    Design principle: Agents contain ONLY workflow logic. Infrastructure concerns
+    (cost tracking, observability, retry) are handled by the Lifecycle Layer.
     """
 
-    # -- Class-level metadata --
+    # ── Class-level metadata (required by every concrete agent) ──────
     name: ClassVar[str]
-    version: ClassVar[str]
-    description: ClassVar[str]
-    capabilities: ClassVar[list[str]]  # Functional declarations surfaced to MCP clients for tool discovery
-    tags: ClassVar[list[str]] = []     # Free-form labels used by the Registry (e.g. ["text", "reasoning"])
+    version: ClassVar[str] = "0.0.1"
+    description: ClassVar[str] = ""
+    capabilities: ClassVar[list[str]] = []
+    tags: ClassVar[list[str]] = []
     requires_llm: ClassVar[bool] = True
-    default_model: ClassVar[str] = "openai/gpt-4o-mini"
+    default_model: ClassVar[str | None] = None   # None = resolved from env/config at init time
 
-    # -- Prompt declarations --
-    # Declared at class level so they're inspectable without execution.
-    # system_prompt: used by single-step agents or as the base prompt for multi-step agents.
-    # step_prompts: per-step prompt templates for multi-step agents. Keys are step names.
-    # Both are ClassVars so describe() and debug() can expose them without running the agent.
+    # ── Prompt declarations (inspectable without execution) ────────
     system_prompt: ClassVar[str] = ""
     step_prompts: ClassVar[dict[str, str]] = {}  # {"analyze": "...", "evaluate": "...", ...}
-
-    # -- Instructor client backed by LiteLLM (lazy-initialized) --
-    _client: object | None = None
-    _graph: object | None = None  # Compiled LangGraph; built once per instance
 
     def __init__(
         self,
         model: str | None = None,
         step_models: dict[str, str] | None = None,
+        **kwargs: Any,  # subclasses may pop additional init args before calling super()
     ) -> None:
         """Initialize agent instance.
 
@@ -344,261 +533,133 @@ class Agent(ABC, Generic[InputT, OutputT]):
             model: Model to use for all steps (can be overridden by step_models)
             step_models: Per-step model overrides
         """
-        # Store instance-level model configuration
-        # Priority: explicit model > class default > config.resolve_model() (auto-detects from API key)
+        kwargs.pop("system_prompt", None)  # system_prompt is ClassVar; reject instance override
+
         config = get_config()
         self._model = model or self.default_model or config.resolve_model()
         self._step_models = step_models or {}
-
-        # Initialize cached graph (lazy-built by _get_graph)
         self._graph = None
-        # Thread-safe client initialization
         self._client_lock = threading.Lock()
 
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        sp = cls.__dict__.get("system_prompt")
-        if sp is not None and not isinstance(sp, property) and not isinstance(sp, str):
-            raise TypeError(
-                f"{cls.__name__}.system_prompt must be a str, got {type(sp).__name__}"
-            )
-        if (
-            getattr(cls, "requires_llm", False)
-            and not getattr(cls, "system_prompt", "")
-            and not cls.step_prompts
-            and not isinstance(cls.__dict__.get("system_prompt"), property)
-        ):
-            import warnings
-            warnings.warn(
-                f"{cls.__name__} has requires_llm=True but neither system_prompt "
-                "nor step_prompts declared. Consider adding prompts for discoverability.",
-                stacklevel=2,
-            )
+    # ── Type introspection ─────────────────────────────────────────
 
-    def _get_client(self):
-        """Lazily initialize the Instructor client over LiteLLM."""
-        if self._client is None:
-            import instructor
-            from litellm import completion
-            self._client = instructor.from_litellm(completion)
-        return self._client
+    @classmethod
+    def input_type(cls) -> type[InputT]:
+        """Return the InputT class, resolved via __orig_bases__ introspection."""
+        return cls._resolve_type("input")
 
-    def _get_graph(self):
+    @classmethod
+    def output_type(cls) -> type[OutputT]:
+        """Return the OutputT class, resolved via __orig_bases__ introspection."""
+        return cls._resolve_type("output")
+
+    @classmethod
+    def _resolve_type(cls, position: str) -> type[Any]:
+        idx = 0 if position == "input" else 1
+        if not hasattr(cls, "__orig_bases__"):
+            raise ValueError(f"Agent {cls.__name__} has no __orig_bases__")
+        for base in cls.__orig_bases__:
+            if get_origin(base) is Agent or (
+                hasattr(base, "__origin__") and get_origin(base).__name__ == "Agent"
+            ):
+                args = get_args(base)
+                if len(args) > idx:
+                    return cast(type[Any], args[idx])
+        raise ValueError(f"Could not resolve {position}_type for {cls.__name__}")
+
+    # ── Extraction primitive (the ONLY place agents call LLMs) ─────
+
+    def _get_client(self, model: str | None = None) -> Any:
+        """Get or create a mode-aware cached Instructor client.
+
+        Mode is determined per model:
+        - TOOLS mode for models that support function calling (most providers)
+        - MD_JSON fallback for models with JSON-only completion
+
+        The client is cached per mode (not per model string), using
+        double-checked locking for thread safety.
         """
-        Lazily build and compile the internal LangGraph graph.
-        Multi-step agents implement _build_graph() to return a compiled graph.
-        Single-step agents don't override this — _get_graph() returns None.
-        """
-        if self._graph is None and hasattr(self, "_build_graph"):
-            self._graph = self._build_graph()
-        return self._graph
+        import instructor
+        import litellm
 
-    # -- Multi-step graph support (override in multi-step agents) --
+        resolved_model = model or self._model
+        supports_tools = litellm.supports_function_calling(resolved_model)
+        mode = instructor.Mode.TOOLS if supports_tools else instructor.Mode.MD_JSON
+        cache_attr = f"_instructor_client_{mode.name}"
 
-    def _build_graph(self):
-        """
-        Override to define the internal multi-step LangGraph workflow.
-        Returns a compiled LangGraph StateGraph.
+        if not hasattr(self, cache_attr):
+            with self._client_lock:
+                if not hasattr(self, cache_attr):
+                    client = instructor.from_litellm(litellm.completion, mode=mode)
+                    object.__setattr__(self, cache_attr, client)
 
-        This is a private method. The compiled graph is a hidden implementation
-        detail — callers use run(), not the graph directly.
-
-        Example:
-            def _build_graph(self):
-                from langgraph.graph import StateGraph, END
-                graph = StateGraph(MyState)
-                graph.add_node("analyze", self._step_analyze)
-                graph.add_node("synthesize", self._step_synthesize)
-                graph.add_node("evaluate", self._step_evaluate)
-                graph.add_edge("analyze", "synthesize")
-                graph.add_conditional_edges(
-                    "evaluate",
-                    lambda s: "refine" if s.quality_score < 0.8 else END,
-                )
-                graph.set_entry_point("analyze")
-                return graph.compile()
-        """
-        return None  # Default: agent is single-step, no graph needed
-
-    # -- Instructor extraction primitives --
+        return getattr(self, cache_attr)
 
     def _extract(
         self,
         response_model: type[BaseModel],
         messages: list[dict[str, str]],
-        max_retries: int = 3,
         model: str | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> BaseModel:
-        """
-        Structured extraction via Instructor + LiteLLM. The core primitive every
-        step in a DopeAgents workflow uses.
+        """Structured extraction via Instructor + LiteLLM.
 
-        - Calls the LLM via Instructor's LiteLLM-backed client
-        - Validates response against response_model (Pydantic)
-        - Automatically retries with validation error feedback on schema mismatch
-        - Uses LiteLLM's model routing + pricing metadata for provider/cost coverage
+        The only method agents call to interact with LLMs. Includes a
+        4-attempt retry loop with provider-error handling.
 
         Args:
-            model: Optional model override. When provided (e.g., from a
-                   step_models entry or context.model_override), takes precedence
-                   over self._model. This avoids instance mutation in run() (INV-2).
-
-        Agent authors call this inside step methods instead of raw LLM APIs.
-        The lifecycle layer hooks into Instructor's event system to capture
-        cost and observability per call (per step).
+            response_model: Pydantic model for validation
+            messages: list of {"role", "content"} dicts
+            model: Override model for this call (falls back to self._model)
         """
-        client = self._get_client()
-        return client.chat.completions.create(
-            model=model or self._model,
-            response_model=response_model,
-            messages=messages,
-            max_retries=max_retries,
-            **kwargs,
-        )
+        from dopeagents.errors import ExtractionProviderError
+
+        resolved_model = model or self._model
+        litellm_client = self._get_client(resolved_model)
+
+        for attempt in range(4):
+            try:
+                return litellm_client.chat.completions.create(
+                    model=resolved_model,
+                    response_model=response_model,
+                    messages=messages,
+                    **kwargs,
+                )
+            except Exception as exc:
+                if attempt == 3:
+                    raise ExtractionProviderError(str(exc)) from exc
+        raise RuntimeError("_extract: exhausted retries")  # unreachable
 
     def _extract_partial(
         self,
         response_model: type[BaseModel],
         messages: list[dict[str, str]],
         model: str | None = None,
-        **kwargs,
-    ):
-        """Streaming extraction via Instructor. Returns partial results as they arrive."""
-        client = self._get_client()
-        return client.chat.completions.create_partial(
-            model=model or self._model,
-            response_model=response_model,
-            messages=messages,
-            **kwargs,
+        **kwargs: Any,
+    ) -> BaseModel:
+        """Streaming extraction (not yet implemented — raises NotImplementedError)."""
+        raise NotImplementedError(
+            "_extract_partial() is implemented when streaming support is added"
         )
 
-    def _model_for_step(self, step_name: str) -> str:
-        """Returns the model to use for a given step, respecting step_models overrides."""
-        return self._step_models.get(step_name, self._model)
-
-    # -- Type introspection --
-
-    @classmethod
-    def input_type(cls) -> type[BaseModel]:
-        """Returns the Pydantic model class for this agent's input."""
-        for base in cls.__orig_bases__:
-            origin = get_origin(base)
-            if origin is Agent or (isinstance(origin, type) and issubclass(origin, Agent)):
-                args = get_args(base)
-                if args and len(args) >= 1:
-                    return args[0]
-        raise TypeError(
-            f"Agent {cls.__name__} must specify Generic types: Agent[InputT, OutputT]"
-        )
-
-    @classmethod
-    def output_type(cls) -> type[BaseModel]:
-        """Returns the Pydantic model class for this agent's output."""
-        for base in cls.__orig_bases__:
-            origin = get_origin(base)
-            if origin is Agent or (isinstance(origin, type) and issubclass(origin, Agent)):
-                args = get_args(base)
-                if args and len(args) >= 2:
-                    return args[1]
-        raise TypeError(
-            f"Agent {cls.__name__} must specify Generic types: Agent[InputT, OutputT]"
-        )
-
-    @classmethod
-    def metadata(cls) -> AgentMetadata:
-        """Returns structured metadata about this agent."""
-        return AgentMetadata(
-            name=cls.name,
-            version=cls.version,
-            description=cls.description,
-            capabilities=cls.capabilities,
-            tags=cls.tags,
-            requires_llm=cls.requires_llm,
-            default_model=cls.default_model,
-            system_prompt=cls.system_prompt,
-            step_prompts=cls.step_prompts,
-            input_schema=cls.input_type().model_json_schema(),
-            output_schema=cls.output_type().model_json_schema(),
-        )
-
-    def to_metadata(self) -> dict:
-        """Returns agent metadata as a dict capturing instance-level state."""
-        is_overridden = self.system_prompt != self.__class__.system_prompt
-        steps = list(self.step_prompts.keys()) if self.step_prompts else []
-        return {
-            "name": self.name,
-            "version": self.version,
-            "description": self.description,
-            "model": self._model,
-            "capabilities": self.capabilities,
-            "requires_llm": self.requires_llm,
-            "system_prompt": self.system_prompt,
-            "system_prompt_overridden": is_overridden,
-            "step_prompts": self.step_prompts,
-            "steps": steps,
-            "is_multi_step": bool(steps),
-            "input_schema": self.input_type().model_json_schema(),
-            "output_schema": self.output_type().model_json_schema(),
-        }
-
-    # -- Core interface --
+    # ── Public interface ───────────────────────────────────────────
 
     @abstractmethod
-    def run(self, input: InputT, context: AgentContext | None = None) -> OutputT:
+    def run(self, input_data: InputT, context: AgentContext | None = None) -> AgentResult[OutputT]:
+        """Run the agent on input and return a wrapped AgentResult.
+
+        Args:
+            input_data: Instance of InputT
+            context: Optional execution context
+
+        Returns:
+            AgentResult[OutputT] with output and execution metadata
         """
-        Execute the agent's core logic.
+        pass
 
-        Single-step agents implement this directly using self._extract().
-        Multi-step agents implement _build_graph() instead; the base class
-        can drive the graph from run() via self._get_graph().invoke(state).
-
-        This method must be:
-        - Stateless: no mutation of self or external state
-        - Typed: input and output match the declared schemas
-        - Focused: only core logic, no retry/caching/observability
-        """
-        ...
-
-    # -- Debug and describe interfaces --
-
-    def debug(self, input: InputT) -> "DebugInfo":
-        """
-        Returns everything needed to understand what this agent will do
-        with the given input, WITHOUT executing it.
-
-        For multi-step agents, this includes step_prompts, step_schemas,
-        and a description of the internal graph structure.
-        """
-        step_schemas = {}
-        for step_name in self.step_prompts:
-            method = getattr(self, f"_step_{step_name}", None)
-            if method and hasattr(method, "__annotations__"):
-                step_schemas[step_name] = method.__annotations__
-        return DebugInfo(
-            agent_name=self.name,
-            model=self._model if self.requires_llm else None,
-            input_data=input.model_dump(),
-            input_schema=self.input_type().model_json_schema(),
-            output_schema=self.output_type().model_json_schema(),
-            requires_llm=self.requires_llm,
-            prompt=self._render_prompt(input) if self.requires_llm else None,
-            model_config_data=self._get_model_config() if self.requires_llm else None,
-            extraction_mode=self._get_extraction_mode() if self.requires_llm else None,
-            step_prompts=self.step_prompts if self.step_prompts else None,
-            step_schemas=step_schemas if step_schemas else None,
-            is_multi_step=bool(self.step_prompts),
-        )
-
-    def describe(self) -> "AgentDescription":
-        """
-        Returns a structured description of the agent — steps, loop structure,
-        model assignments — without executing it.
-
-        Used by: CLI `dopeagents describe`, MCP resource endpoints,
-                 Agent Registry catalog, benchmarking tools.
-        """
-        steps = list(self.step_prompts.keys()) if self.step_prompts else []
+    def describe(self) -> AgentDescription:
+        """Return structured description of this agent (no LLM calls)."""
+        steps = list(self.step_prompts.keys())
         return AgentDescription(
             name=self.name,
             version=self.version,
@@ -606,112 +667,135 @@ class Agent(ABC, Generic[InputT, OutputT]):
             is_multi_step=bool(steps),
             steps=steps,
             has_loops=self._has_loops(),
-            default_model=self._model,
-            step_models=self._step_models,
-            capabilities=list(self.capabilities),
-            tags=list(self.tags),
+            capabilities=self.capabilities,
+            tags=self.tags,
+            requires_llm=self.requires_llm,
+            default_model=self.default_model,
             input_schema=self.input_type().model_json_schema(),
             output_schema=self.output_type().model_json_schema(),
         )
 
+    def debug(self, input_data: InputT) -> DebugInfo:  # noqa: ARG002
+        """Return complete debug info without executing the agent.
+
+        Shows graph structure, prompts, and schemas. No LLM calls, no cost.
+        """
+        return DebugInfo(
+            is_multi_step=self._has_loops() or bool(self.step_prompts),
+            step_prompts=self.step_prompts,
+            system_prompt=self.system_prompt,
+            input_schema=self.input_type().model_json_schema(),
+            output_schema=self.output_type().model_json_schema(),
+        )
+
+    def metadata(self) -> AgentMetadata:
+        """Return structured metadata (used by registry, composition checker, MCP)."""
+        return AgentMetadata(
+            name=self.name, version=self.version, description=self.description,
+            capabilities=self.capabilities, tags=self.tags,
+            requires_llm=self.requires_llm, default_model=self.default_model,
+            system_prompt=self.system_prompt, step_prompts=self.step_prompts,
+            input_schema=self.input_type().model_json_schema(),
+            output_schema=self.output_type().model_json_schema(),
+        )
+
+    # ── Framework adapters (lazy imports; concrete impls in adapters/) ─
+
+    def as_callable(self) -> Callable[[InputT], OutputT]:
+        """Wrap agent as a plain Python callable."""
+        def wrapper(input_data: InputT) -> OutputT:
+            result = self.run(input_data)
+            if result.error:
+                raise RuntimeError(result.error)
+            if result.output is None:
+                raise RuntimeError("Agent returned None output")
+            return result.output
+        return wrapper
+
+    def as_langchain_runnable(self) -> Any:
+        """Wrap agent as a LangChain Runnable. Requires: pip install dopeagents[langchain]"""
+        from dopeagents.adapters.langchain_adapter import agent_to_langchain_runnable
+        return agent_to_langchain_runnable(self)
+
+    def as_langgraph_node(self) -> Any:
+        """Wrap agent as a LangGraph node (langgraph is a core dep)."""
+        from dopeagents.adapters.langgraph_adapter import agent_to_langgraph_node
+        return agent_to_langgraph_node(self)
+
+    def as_crewai_tool(self) -> Any:
+        """Wrap agent as a CrewAI tool. Requires: pip install dopeagents[crewai]"""
+        from dopeagents.adapters.crewai_adapter import agent_to_crewai_tool
+        return agent_to_crewai_tool(self)
+
+    def as_autogen_function(self) -> Any:
+        """Wrap agent as an AutoGen function. Requires: pip install dopeagents[autogen]"""
+        from dopeagents.adapters.autogen_adapter import agent_to_autogen_function
+        return agent_to_autogen_function(self)
+
+    def as_openai_function(self) -> dict[str, Any]:
+        """Return OpenAI function-calling schema dict."""
+        return {
+            "name": self.name.lower().replace(" ", "_"),
+            "description": self.description,
+            "parameters": self.input_type().model_json_schema(),
+        }
+
+    def as_mcp_tool(self, server: Any | None = None) -> Any:
+        """Register agent as MCP tool on a FastMCP server."""
+        from dopeagents.mcp_server.server import register_agent_as_mcp_tool
+        return register_agent_as_mcp_tool(self, server)
+
+    def as_mcp_server(self) -> Any:
+        """Create a standalone MCP server exposing this agent as a tool."""
+        from dopeagents.mcp_server.server import create_single_agent_mcp_server
+        return create_single_agent_mcp_server(self)
+
+    # ── Introspection helpers ──────────────────────────────────────
+
     def _has_loops(self) -> bool:
-        """Override in multi-step agents that contain refinement loops."""
+        """Whether this agent has internal refinement loops. Override in subclasses."""
         return False
 
-    def _render_prompt(self, input: InputT) -> str | None:
-        """Override in LLM-based agents to expose the rendered prompt for debugging."""
+    def _build_graph(self) -> Any:
+        """Build the internal LangGraph (override in multi-step agents)."""
         return None
 
-    def _get_model_config(self) -> dict | None:
-        """Override in LLM-based agents to expose model configuration."""
-        return None
+    def _get_graph(self) -> Any:
+        """Lazily build and cache the internal LangGraph."""
+        if self._graph is None and hasattr(self, "_build_graph"):
+            self._graph = self._build_graph()
+        return self._graph
 
-    def _get_extraction_mode(self) -> str | None:
-        """Returns the Instructor extraction mode for the current provider."""
-        try:
-            client = self._get_client()
-            return str(getattr(client, 'mode', 'auto'))
-        except Exception:
-            return "auto"
+    def _model_for_step(self, step_name: str) -> str:
+        """Return the model to use for a given step (respects step_models overrides)."""
+        return self._step_models.get(step_name, self._model)
 
-    # -- Framework Adapters --
-    # All adapters use lazy imports. Framework dependencies are optional.
-    # Every agent inherits these — no per-agent adapter code needed.
+    @contextmanager
+    def _step_span(self, step_name: str) -> Generator[Span | None, None, None]:
+        """Create a tracer span for a step if a tracer was injected via context.metadata.
 
-    def as_langchain_runnable(self, **kwargs):
-        """Use this agent as a LangChain Runnable in LCEL chains."""
-        from dopeagents.adapters.langchain import to_langchain_runnable
-        return to_langchain_runnable(self, **kwargs)
+        When AgentExecutor runs the agent it populates context.metadata["tracer"].
+        This helper reads that value and opens a child span for the step.
+        When running standalone (no executor), the helper yields None and the
+        agent executes without tracing — no code changes required.
+        """
+        tracer = getattr(self._run_local, "context", None)
+        tracer = tracer and tracer.metadata.get("tracer")
+        if tracer:
+            with tracer.start_span(step_name) as span:
+                yield span
+        else:
+            yield None
 
-    def as_langchain_tool(self, **kwargs):
-        """Use this agent as a LangChain Tool for agents."""
-        from dopeagents.adapters.langchain import to_langchain_tool
-        return to_langchain_tool(self, **kwargs)
+    def _budget_config(self) -> BudgetConfig | None:
+        """Return the BudgetConfig injected by AgentExecutor, or None.
 
-    def as_crewai_tool(self, **kwargs):
-        """Use this agent as a CrewAI tool."""
-        from dopeagents.adapters.crewai import to_crewai_tool
-        return to_crewai_tool(self, **kwargs)
-
-    def as_autogen_function(self, **kwargs):
-        """Use this agent as an AutoGen callable function."""
-        from dopeagents.adapters.autogen import to_autogen_function
-        return to_autogen_function(self, **kwargs)
-
-    def as_openai_function(self, **kwargs):
-        """Get OpenAI function calling schema + callable."""
-        from dopeagents.adapters.openai_functions import to_openai_function
-        return to_openai_function(self, **kwargs)
-
-    def as_callable(self, **kwargs):
-        """Get a plain callable (fallback for any framework)."""
-        from dopeagents.adapters.generic import to_callable
-        return to_callable(self, **kwargs)
-
-    # -- MCP Adapters --
-
-    def as_mcp_tool(self, mcp_server, **kwargs):
-        """Register this agent as a tool on a FastMCP server instance."""
-        from dopeagents.adapters.mcp import register_agent_as_mcp_tool
-        return register_agent_as_mcp_tool(self, mcp_server, **kwargs)
-
-    def as_mcp_server(self, name: str | None = None, **kwargs):
-        """Create a standalone MCP server exposing just this agent."""
-        from dopeagents.adapters.mcp import create_single_agent_mcp_server
-        return create_single_agent_mcp_server(self, name=name, **kwargs)
-
-
-class DebugInfo(BaseModel):
-    """Complete transparency into what an agent will do with a given input."""
-    agent_name: str
-    model: str | None = None
-    input_data: dict
-    input_schema: dict
-    output_schema: dict
-    requires_llm: bool
-    prompt: str | None = None
-    model_config_data: dict | None = None
-    extraction_mode: str | None = None
-    # Multi-step specific
-    step_prompts: dict[str, str] | None = None    # Per-step prompt templates
-    step_schemas: dict[str, dict] | None = None   # Per-step output schemas
-    is_multi_step: bool = False
-
-
-class AgentDescription(BaseModel):
-    """Structured description of an agent — its steps, loop structure, and model assignments."""
-    name: str
-    version: str
-    description: str
-    is_multi_step: bool
-    steps: list[str]                    # Ordered list of step names (empty for single-step)
-    has_loops: bool                     # True if the graph contains refinement loops
-    default_model: str
-    step_models: dict[str, str]         # Per-step model overrides (empty dict if none)
-    capabilities: list[str]
-    tags: list[str]
-    input_schema: dict
-    output_schema: dict
+        Agents can consult budget limits (e.g. to decide whether another
+        refinement loop is worth the cost). Returns None when running
+        standalone, so callers must handle the absent-budget case.
+        """
+        ctx = getattr(self._run_local, "context", None)
+        return ctx and ctx.metadata.get("budget")
 ```
 
 ### 3.2 Agent Metadata
@@ -750,25 +834,35 @@ class AgentMetadata(BaseModel):
 from pydantic import BaseModel, Field
 from typing import Any
 from uuid import UUID, uuid4
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 
 class AgentContext(BaseModel):
-    """
-    Execution context passed to agents.
-    Contains metadata about the current execution but NO application state.
+    """Execution context passed to agents with run ID, timestamps, and metadata.
+
+    Carries execution runtime information but NOT budget guards or retries —
+    those are concerns of the Lifecycle Layer (AgentExecutor). Created once
+    per agent.run() call and shared across all internal steps.
     """
     run_id: UUID = Field(default_factory=uuid4)
-    trace_id: UUID | None = None
-    parent_agent: str | None = None
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    environment: str = "development"
-    max_cost_usd: float | None = None
-    max_tokens: int | None = None
-    model_override: str | None = None
-    mcp_request_id: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        description="When this context was created",
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Application-specific metadata (tracing, user info, etc.)",
+    )
 ```
+
+**Standard metadata keys (populated by `AgentExecutor`):**
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `"tracer"` | `Tracer` | Tracer instance (`ConsoleTracer`, `OTelTracer`, …). Agents read it via `_step_span()` to create child spans per step. |
+| `"budget"` | `BudgetConfig` | Cost/token budget limits. Agents read it via `_budget_config()` to make budget-aware decisions (e.g. skipping refinement loops). |
+
+When running standalone (no `AgentExecutor`), these keys are absent and the agent helpers degrade gracefully (return `None`, skip tracing, skip budget checks).
 
 ### 3.4 Agent Result Wrapper
 
@@ -883,15 +977,16 @@ class Classifier(Agent[ClassifierInput, ClassifierOutput]):
         "You are a text classification agent. Choose the single best category."
     )
 
-    def run(self, input: ClassifierInput, context=None) -> ClassifierOutput:
-        cats = ", ".join(input.categories)
-        return self._extract(
+    def run(self, input_data: ClassifierInput, context: AgentContext | None = None) -> AgentResult[ClassifierOutput]:
+        cats = ", ".join(input_data.categories)
+        output = self._extract(
             response_model=ClassifierOutput,
             messages=[
                 {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": f"Classify into [{cats}]:\n\n{input.text}"},
+                {"role": "user", "content": f"Classify into [{cats}]:\n\n{input_data.text}"},
             ],
         )
+        return AgentResult(output=output)
 ```
 
 Key design points:
@@ -983,15 +1078,16 @@ class AnalyzingAgent(Agent[AnalyzeInput, AnalyzeOutput]):
     def _has_loops(self) -> bool:
         return True  # The evaluate→refine→evaluate cycle is a loop
 
-    def run(self, input: AnalyzeInput, context=None) -> AnalyzeOutput:
+    def run(self, input_data: AnalyzeInput, context: AgentContext | None = None) -> AgentResult[AnalyzeOutput]:
         graph = self._get_graph()
-        final_state = graph.invoke({"text": input.text, "refinement_rounds": 0})
+        final_state = graph.invoke({"text": input_data.text, "refinement_rounds": 0})
         result = final_state.get("refined") or final_state["draft"]
-        return AnalyzeOutput(
+        output = AnalyzeOutput(
             result=result,
             quality_score=final_state["quality_score"],
             refinement_rounds=final_state["refinement_rounds"],
         )
+        return AgentResult(output=output)
 
     def _step_analyze(self, state: AnalysisState) -> dict[str, Any]:
         out: _AnalyzeStepOut = self._extract(
@@ -1049,9 +1145,83 @@ Key design points for multi-step agents:
 - **`_build_graph()` is private:** Callers use `run()`. The graph is never exposed.
 - **Each step calls `self._extract()` once:** The lifecycle layer captures cost/latency per `_extract()` call, which maps to one step. Total metrics aggregate across all steps.
 - **`_model_for_step(step_name)`:** Returns the per-step model override when set in `step_models`, or falls back to `self._model`.
+- **`_step_span(step_name)`:** Opens a tracer child span for the step when `context.metadata["tracer"]` is present. Steps wrap their body in `with self._step_span("step") as span:` and attach attributes to the span. No-op when running standalone.
+- **`_budget_config()`:** Returns the `BudgetConfig` from `context.metadata["budget"]` if injected by `AgentExecutor`, else `None`. Used in refinement guards to respect budget limits.
 - **`_has_loops() → True`:** Tells `describe()` and the CLI that this agent has a conditional refinement cycle.
 
-> **Full reference implementation:** See §17 Core Agents — `DeepSummarizer` (7-step with refinement loop) and `ResearchAgent` (6-step).
+> **Full reference implementation:** See §17 Core Agents — `DeepSummarizer` (7-step with refinement loop) and `DeepResearcher` (13-step hybrid).
+
+#### Pattern C: Hybrid Agent (Coded Pipeline + Bounded LLM Tool Calling)
+
+A hybrid agent extends Pattern B: most steps are pure code or pure `_extract()` calls. One or more **judgment steps** additionally give the LLM bounded access to tools — letting it do targeted fact-checking, gap-filling, or citation lookups while the macro orchestration flow remains deterministic.
+
+The fundamental contract:
+
+| Layer            | Responsibility                                                        |
+| ---------------- | --------------------------------------------------------------------- |
+| **Pipeline (code)** | Decides macro flow — which steps run, in what order, always          |
+| **LLM (in hybrid steps)** | Decides micro flow — whether to call tools, which ones, when to stop |
+| **Budget (code)** | Enforces hard limits — caps total tool calls per step, prevents runaway loops |
+
+```python
+# dopeagents/agents/example_hybrid.py
+from dopeagents.agents._researcher.tools import ToolBudget, ToolExecutor, ANALYSIS_TOOLS
+from dopeagents.agents._researcher.hybrid_step import HybridStepRunner, HybridStepResult
+from dopeagents.agents._researcher.model_capability import detect_capability
+
+class HybridDeepResearcher(Agent[HybridInput, HybridOutput]):
+    """
+    Pipeline structure (code-controlled):
+      Step 1: expand_query  — LLM only (no tools)
+      Step 2: real_search   — CODE (deterministic)
+      Step 3: extract       — CODE (deterministic)
+      Step 4: deep_analysis — LLM + TOOLS  ← hybrid step
+      Step 5: synthesize    — LLM only
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._capability = detect_capability(self._model)
+        self._hybrid_runner: HybridStepRunner | None = None
+
+    def _get_hybrid_runner(self) -> HybridStepRunner:
+        if self._hybrid_runner is None:
+            self._hybrid_runner = HybridStepRunner(
+                extract_fn=self._extract,
+                chat_fn=self._chat if self._capability.supports_tool_calling else None,
+                tool_executor=ToolExecutor(...),
+                budget=ToolBudget(max_calls=5),
+                tools_enabled=self._capability.supports_tool_calling,
+            )
+        return self._hybrid_runner
+
+    def _step_deep_analysis(self, state):
+        """Judgment step — LLM may call up to 5 tools to verify claims/fill gaps."""
+        result: HybridStepResult = self._get_hybrid_runner().run(
+            system_prompt=self.step_prompts["deep_analysis"],
+            user_prompt=self._build_analysis_prompt(state),
+            output_model=_DeepAnalysisOut,
+            model=self._model,
+            tools=ANALYSIS_TOOLS,
+        )
+        return {"analysis": result.structured_output}
+```
+
+Key design points for hybrid agents:
+
+- **Macro flow stays in code:** The LangGraph pipeline calls `_step_deep_analysis` at step 4 — it cannot be skipped, reordered, or repeated by the LLM.
+- **Micro autonomy is bounded:** Inside the hybrid step, the LLM may call `fact_check`, `search_for_more`, `lookup_citation`, etc. — but `ToolBudget(max_calls=5)` enforces a hard ceiling.
+- **Graceful degradation by model tier:** `detect_capability(model_name)` returns a `ModelCapability`. If the model doesn't support tool calling, `HybridStepRunner` falls back to direct `_extract()` — same pipeline, no tools, no rewrite needed.
+- **Agent-private infrastructure:** `HybridStepRunner`, `ToolBudget`, `ToolExecutor`, and `ANALYSIS_TOOLS` live in `agents/_researcher/` (agent-private). They are NOT in `research/` (shared domain services). See §18.2.
+- **`HybridStepResult`** carries `structured_output`, `tool_calls`, `budget_summary`, and `llm_rounds` — all inspectable through `AgentResult.metadata` for observability.
+
+**Heuristic for deciding step type:**
+
+| Question | Answer | Step type |
+|---|---|---|
+| Can I write an `if/else` for this decision? | Yes | Code step (always) |
+| Does this require reading comprehension or judgment? | Yes | Pure LLM step |
+| Does this require judgment but might need to verify/fetch? | Yes | Hybrid step (LLM + bounded tools) |
 
 ---
 
@@ -1164,6 +1334,44 @@ agent2.run(input2)  # Uses merged custom + default step_prompts
 | Prompt versioning system              | Agent `version` already covers this. Bump the agent version when the prompt changes meaningfully.                                 |
 | `system_prompt` as a required field | Breaks `SchemaValidator` and any deterministic agent. Default stays `""`.                                                       |
 | Runtime override of `system_prompt` | Violates P8 (stateless). Agent identity is fixed at class time. Per-step variation uses `step_prompts` instead.                 |
+
+#### Instructor Pattern for Step Prompts
+
+> Cross-reference: See **§2.2.1 Instructor: Structured Extraction Modes and Patterns** for detailed explanation of how `step_prompts` interact with Instructor's extraction modes.
+
+**Key insight:** `step_prompts` are always **natural-language instructions only**. You must never instruct the model to "return this exact JSON structure" or "use this format."
+
+Why? Because Instructor automatically enforces the output schema (either via function calling / tool definitions, or via MD_JSON mode with schema hints). Telling the model to return specific JSON conflicts with Instructor's schema injection and breaks parsing.
+
+**CORRECT pattern:**
+```python
+step_prompts = {
+    "evaluate": (
+        "Score this summary on faithfulness, completeness, and coherence. "
+        "For each dimension, provide a score 0.0–1.0 and brief reasoning."
+    )
+}
+# Instructor injects the EvaluateOut schema automatically
+result = self._extract(
+    response_model=EvaluateOut,
+    messages=[
+        {"role": "system", "content": self.system_prompt},
+        {"role": "user", "content": f"{step_prompts['evaluate']}\n\nSummary: {text}"}
+    ]
+)
+```
+
+**WRONG pattern:**
+```python
+step_prompts = {
+    "evaluate": (
+        "Score this summary. RETURN ONLY THIS JSON (no markdown blocks):\n"
+        '{"faithfulness": 0.8, "completeness": 0.9, "coherence": 0.85}'
+    )
+}
+# This conflicts with Instructor's schema — model gets conflicting signals
+# and may fail validation or return malformed data
+```
 
 ---
 
@@ -1574,7 +1782,7 @@ class AgentExecutor:
         with self.tracer.span(
             name=f"agent.{agent.name}",
             run_id=run_id,
-            trace_id=context.trace_id,
+            trace_id=getattr(context, "trace_id", None),
         ) as span:
 
             # [1] Pre-execution
@@ -1945,7 +2153,7 @@ class SandboxRunner:
 
     def describe(self, agent: Agent) -> dict:
         """Returns agent metadata including input/output schemas."""
-        meta = type(agent).metadata()
+        meta = agent.metadata()
         return meta.model_dump()
 
     def dry_run(self, agent: Agent, **kwargs) -> "DebugInfo":
@@ -2233,7 +2441,7 @@ def sandbox_run(agent_name, input_json, model, output_format):
     context = None
     if model:
         from dopeagents.core.context import AgentContext
-        context = AgentContext(model_override=model)
+        context = AgentContext(metadata={"model_override": model})
     result = runner.run(agent, context=context, **kwargs)
     if output_format == "json":
         click.echo(result.model_dump_json(indent=2))
@@ -2609,7 +2817,7 @@ class InstructorObservabilityHooks:
 
 > 📄 **File:** `dopeagents/observability/logging.py` | **Status:** ● Implemented | **Role:** `get_logger()` factory returning a named `logging.Logger` with configurable level
 
-> 📄 **File:** `dopeagents/observability/debug.py` | **Status:** ● Implemented | **Role:** `DebugInfo` model and debug-mode helpers for development-time introspection
+> 📄 **File:** `dopeagents/observability/debug.py` | **Status:** ○ Stub | **Role:** Debug utilities placeholder — `DebugInfo` lives in `dopeagents/core/agent.py`
 
 > **Note:** The earlier `contract.py` design (PII field declarations on the observability layer) was superseded. PII redaction lives in `dopeagents/security/redaction.py` (§21). `logging.py` provides structured logger access; `debug.py` provides `DebugInfo` attached to `AgentResult` during development.
 
@@ -3020,10 +3228,10 @@ class DiskCache(CacheManager):
 
 ### 11.2 LangGraph Adapter
 
-> 📄 **File:** `dopeagents/adapters/langgraph.py` | **Status:** ○ Stub | **Role:** Converts agent to LangGraph `StateGraph` node function with state key mapping
+> 📄 **File:** `dopeagents/adapters/langgraph_adapter.py` | **Status:** ◐ Scaffold | **Role:** Converts agent to LangGraph `StateGraph` node function with state key mapping
 
 ```python
-# dopeagents/adapters/langgraph.py
+# dopeagents/adapters/langgraph_adapter.py
 
 from typing import Any
 from dopeagents.core.agent import Agent
@@ -3088,10 +3296,10 @@ def to_langgraph_node(
 
 ### 11.3 LangChain Adapter
 
-> 📄 **File:** `dopeagents/adapters/langchain.py` | **Status:** ○ Stub | **Role:** Converts agent to LangChain `Runnable` or `BaseTool`
+> 📄 **File:** `dopeagents/adapters/langchain_adapter.py` | **Status:** ◐ Scaffold | **Role:** Converts agent to LangChain `Runnable` or `BaseTool`
 
 ```python
-# dopeagents/adapters/langchain.py
+# dopeagents/adapters/langchain_adapter.py
 
 from typing import Any
 from dopeagents.core.agent import Agent
@@ -3175,10 +3383,10 @@ def to_langchain_tool(agent: Agent, description_override: str | None = None) -> 
 
 ### 11.4 CrewAI Adapter
 
-> 📄 **File:** `dopeagents/adapters/crewai.py` | **Status:** ○ Stub | **Role:** Converts agent to CrewAI `BaseTool`
+> 📄 **File:** `dopeagents/adapters/crewai_adapter.py` | **Status:** ◐ Scaffold | **Role:** Converts agent to CrewAI `BaseTool`
 
 ```python
-# dopeagents/adapters/crewai.py
+# dopeagents/adapters/crewai_adapter.py
 
 from typing import Any
 from dopeagents.core.agent import Agent
@@ -3215,10 +3423,10 @@ def to_crewai_tool(agent: Agent, description_override: str | None = None) -> Any
 
 ### 11.5 AutoGen Adapter
 
-> 📄 **File:** `dopeagents/adapters/autogen.py` | **Status:** ○ Stub | **Role:** Converts agent to AutoGen function calling format
+> 📄 **File:** `dopeagents/adapters/autogen_adapter.py` | **Status:** ◐ Scaffold | **Role:** Converts agent to AutoGen function calling format
 
 ```python
-# dopeagents/adapters/autogen.py
+# dopeagents/adapters/autogen_adapter.py
 
 from typing import Any
 from dopeagents.core.agent import Agent
@@ -3338,7 +3546,7 @@ def to_callable(
 
 ### 11.8 SimpleRunner
 
-> 📄 **File:** `dopeagents/adapters/simple.py` | **Status:**   Implemented | **Role:** Minimal convenience wrapper around `AgentExecutor`
+> 📄 **File:** `dopeagents/adapters/simple.py` | **Status:** ○ Not yet created | **Role:** Minimal convenience wrapper around `AgentExecutor` (planned for Phase 5; not yet exported — see §23)
 
 ```python
 # dopeagents/adapters/simple.py
@@ -3879,7 +4087,7 @@ class BenchmarkRunner:
         results = []
         for case in suite.cases:
             input_model = type(agent).input_type().model_validate(case.input_data)
-            context = AgentContext(model_override=model)
+            context = AgentContext(metadata={"model_override": model} if model else {})
             start = time.monotonic()
             try:
                 result = agent.run(input_model, context)
@@ -4156,10 +4364,10 @@ DopeAgents ships production-grade multi-step agents. The agent list is shaped by
 
 ### Phase 1 — Reference Agents
 
-| Agent                    | Type           | Input                          | Output                                                                  |
-| ------------------------ | -------------- | ------------------------------ | ----------------------------------------------------------------------- |
-| **DeepSummarizer** | Multi-step LLM | text, max_length, style, focus | summary, quality_score, refinement_rounds, chunks_processed, key_points |
-| **ResearchAgent**  | Multi-step LLM | query, max_sources, depth      | report, sources, confidence_scores, citations, fact_check_notes         |
+| Agent                    | Type                    | Input                          | Output                                                                  |
+| ------------------------ | ----------------------- | ------------------------------ | ----------------------------------------------------------------------- |
+| **DeepSummarizer**       | Multi-step LLM          | text, max_length, style, focus | summary, quality_score, refinement_rounds, chunks_processed, key_points |
+| **DeepResearcher**       | Multi-step Hybrid (13-step) | query, research_focus, quality_threshold | report (markdown + JSON), confidence_score, sources, citations |
 
 ---
 
@@ -4200,12 +4408,11 @@ class DeepSummarizerOutput(BaseModel):
     chunks_processed: int                            # number of chunks in the pipeline
     word_count: int
     truncated: bool
-    total_tokens_used: int = Field(default=0)        # approximate total tokens (when available)
 ```
 
 **Implementation Notes:**
 
-- `default_model` is `"groq/openai/gpt-oss-20b"`. Individual steps can be overridden via `step_models`.
+- `default_model` is resolved at runtime via `config.resolve_model()` (auto-detected from the active provider API key). Individual steps can be overridden via `step_models`.
 - Chunk summarization is **parallelized** using `ThreadPoolExecutor` with up to 4 workers when there are multiple chunks.
 - The evaluate→refine loop includes **plateau detection**: if the last two quality scores differ by < 0.02, refinement stops early.
 - Chunks are built from paragraph boundaries with 15% overlap; if no paragraph breaks exist, sentence-aware splitting is used.
@@ -4224,94 +4431,196 @@ print(f"Quality: {result.output.quality_score:.2f}, Refined {result.output.refin
 
 ---
 
-### 17.2 ResearchAgent
+### 17.2 DeepResearcher
 
-> 📄 **File:** `dopeagents/agents/research_agent.py` | **Status:** ● Implemented | **Role:** 6-step research workflow with query expansion, search, source analysis, synthesis, evaluation, and refinement
+> 📄 **File:** `dopeagents/agents/deep_researcher.py` | **Status:** ● Implemented | **Version:** 3.1.0 | **Role:** 13-step hybrid research workflow — coded pipeline with bounded LLM tool calling in the analysis step. Uses real free APIs (Wikipedia, DuckDuckGo, Semantic Scholar, arXiv, CrossRef) with no paid search subscription required.
+
+**Orchestration Strategy: Hybrid (Pattern C)**
+
+The pipeline is code-controlled. The LLM has bounded tool-calling access only inside `deep_analysis`. This gives predictability for all mechanical steps (search, extraction, scoring) and intelligence only where it adds value (claim analysis, synthesis, evaluation).
 
 **Steps (in order):**
 
-| Step            | Purpose                                                       | LLM Strategy                    |
-| --------------- | ------------------------------------------------------------- | ------------------------------- |
-| `expand_query`  | Expand the research query into 3-5 refined search queries    | Default model                   |
-| `search`        | Find relevant sources using expanded queries                 | Default model + Search tool     |
-| `analyze`       | Analyze sources for credibility and key findings             | Default model (score 0-1)       |
-| `synthesize`    | Create evidence-based synthesis with citations               | Default model (quality-focused) |
-| `evaluate`      | Score quality on coverage, credibility, and coherence        | Default model (strict scorer)   |
-| `refine`        | Improve synthesis based on feedback (loops if needed)        | Default model (refinement-focused) |
+| # | Step | Type | Purpose |
+|---|------|------|---------|
+| 1 | `load_context` | CODE | Load prior research sessions from memory |
+| 2 | `expand_query` | LLM | Expand query into multiple targeted search queries |
+| 3 | `real_search` | CODE | Search Wikipedia, DuckDuckGo, Semantic Scholar, arXiv, CrossRef concurrently |
+| 4 | `extract_content` | CODE | Scrape and extract full text from source URLs (8000-char limit) |
+| 5 | `score_sources` | CODE | Score each source for domain authority, recency, and citation count |
+| 6 | `deep_analysis` | **LLM+TOOLS** | Extract claims; optionally fact-check, search gaps, lookup citations (hard budget: 5 calls) |
+| 7 | `cross_reference` | LLM | Cross-reference claims for agreement/contradiction across sources |
+| 8 | `synthesize` | LLM | Synthesize findings into a coherent research narrative with citations |
+| 9 | `calculate_confidence` | CODE | Grounded confidence score from measurable signals (source count, agreement, recency) |
+| 10 | `evaluate` | LLM | Score research quality and identify information gaps |
+| 11 | `refine` | LLM | Targeted gap-filling if quality < threshold (loops back to step 3) |
+| 12 | `generate_report` | LLM+CODE | Render structured report in Markdown and JSON formats |
+| 13 | `save_session` | CODE | Persist session to memory for future follow-up queries |
 
-**Key Design:**
-- Uses LLM-driven query expansion instead of keyword expansion
-- Parallel source evaluation with credibility scoring
-- Self-evaluating loop: synthesize → evaluate → (refine if quality < threshold)
-- Configurable refinement loop limit and quality threshold
-- No external search API required (input text is analyzed directly by LLM)
+**Key design properties:**
+- Steps 1, 3, 4, 5, 9, 13 are pure code — no LLM tokens spent, no variability
+- Step 6 (`deep_analysis`) is the only hybrid step: LLM gets 5 tool calls maximum, hard-coded budget
+- Steps 2, 7, 8, 10, 11, 12 are pure LLM calls via `self._extract()`
+- Step 11 loops back to step 3 (up to `max_refinement_loops` times)
+- Content is ranked by query relevance before LLM input — `_get_relevant_text()` chunks source text and selects the top-5 most relevant passages (max 2500 chars) instead of blind head-truncation
+- Model-tier aware: `detect_capability(model_name)` disables tools for weak/unknown models automatically — same pipeline runs on GPT-4o (tools enabled) or a small open-source model (tools disabled) without code changes
+
+**Instructor Integration Pattern:**
+
+All LLM steps (2, 6, 7, 8, 10, 11, 12) follow the Instructor pattern from **§3.6 "Instructor Pattern for Step Prompts":**
+- **System message:** Carries `self.system_prompt` (agent identity) — "You are an expert research analyst..."
+- **User message:** Combines `self.step_prompts[step_name]` with task-specific data (query, claim details, synthesis, etc.)
+- **Output schema:** Enforced transparently via `response_model=OutputType` — no "RETURN THIS JSON" instructions in prompts
+- **Mode selection:** Automatic via `litellm.supports_function_calling()` — uses tool definitions (Mode.TOOLS) for capable models, falls back to MD_JSON mode for others
+
+This separation keeps prompts clean and natural-language focused while Instructor handles all schema validation invisibly.
+
+**Agent-Private Infrastructure** (`agents/_researcher/`):
+
+All logic specific to `DeepResearcher` lives in this private sub-package. Other agents must not import from it:
+- `hybrid_step.py` — `HybridStepRunner` + `HybridStepResult`: runs one LLM step with bounded tool loop
+- `tools.py` — `ToolBudget`, `ToolExecutor`, `ToolCall`, `ToolResult`, `ANALYSIS_TOOLS` (5 tools)
+- `model_capability.py` — `ModelCapability` + `detect_capability()`: model tier detection
+- `claim_analysis.py` — `Claim`, `ClaimCluster`, `CrossReferenceOutput`: claim data models specific to the 13-step workflow
+- `confidence.py` — `ConfidenceCalculator` + `ConfidenceBreakdown`: grounded confidence score from research-specific signals
+- `memory.py` — `ResearchMemory` + `ResearchSession`: research session persistence with research-specific fields
+- `progress.py` — `ResearchProgress` + `StepProgress`: progress tracking with hardcoded 13-step order
+- `report_generator.py` — `ReportGenerator`, `Citation`, `ReportFormat`, `StructuredReport`: structured report rendering
 
 **Interfaces:**
 
 ```python
-class ResearchAgentInput(BaseModel):
-    query: str = Field(min_length=5, description="Research query or topic")
-    research_focus: str | None = Field(
+class DeepResearcherInput(BaseModel):
+    query: str = Field(min_length=5)
+    research_focus: str | None = None
+    quality_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+    max_refinement_loops: int = Field(default=2, ge=0, le=5)
+    report_format: ReportFormat = Field(default=ReportFormat.MARKDOWN)
+    enable_fact_check: bool = Field(default=True)
+    enable_memory: bool = Field(default=True)
+    enable_tool_calling: bool | None = Field(
         default=None,
-        description="Optional focus area (e.g., 'academic', 'recent news', 'practical')",
+        description="None = auto-detect from model tier. True/False = force."
     )
-    quality_threshold: float = Field(
-        default=0.75, ge=0.0, le=1.0,
-        description="Minimum quality score to accept without refinement",
-    )
-    max_refinement_loops: int = Field(
-        default=2, ge=0, le=5,
-        description="Maximum number of refinement iterations",
-    )
+    tool_budget: int = Field(default=5, ge=0, le=10)
 
-class ResearchAgentOutput(BaseModel):
-    synthesis: str = Field(description="Final research synthesis with citations")
-    key_findings: list[str] = Field(
-        default_factory=list, description="Top findings from research"
-    )
-    quality_score: float = Field(ge=0.0, le=1.0, description="Final quality score")
-    sources_analyzed: int = Field(ge=0, description="Number of sources analyzed")
-    refinement_rounds: int = Field(ge=0, description="Number of refinement loops")
-```
+# Constructor-only config (not Pydantic fields — passed to __init__):
+#   progress_callback   — optional step-level progress callback
+#   google_factcheck_api_key — optional Google Fact Check API key
+#   memory_dir          — storage directory for session persistence
 
-**Reference Implementation:**
+class DeepResearcherOutput(BaseModel):
+    # Core
+    synthesis: str
+    key_findings: list[str]
+    markdown_report: str
+    structured_report: dict[str, Any]
+    report_title: str
 
-```python
-from dopeagents.agents.research_agent import ResearchAgent, ResearchAgentInput
+    # Confidence (grounded signals, not LLM self-eval)
+    confidence: float = Field(ge=0.0, le=1.0)          # grounded confidence score
+    confidence_breakdown: dict[str, Any]
+    llm_quality_score: float = Field(ge=0.0, le=1.0)   # LLM self-evaluated quality
 
-agent = ResearchAgent()
-result = agent.run(
-    ResearchAgentInput(
-        query="What are the latest developments in quantum computing?",
-        research_focus="practical applications",
-        quality_threshold=0.8,
-        max_refinement_loops=3,
-    )
-)
+    # Sources
+    citations: list[dict[str, str]]
+    sources_analyzed: int
+    source_breakdown: dict[str, int]     # count by provider
+    credibility_summary: dict[str, float]
 
-print(result.output.synthesis)
-print(f"Quality Score: {result.output.quality_score}")
-print(f"Refinement Loops: {result.output.refinement_rounds}")
-```
+    # Analysis
+    claim_clusters: list[dict[str, Any]]
+    verified_claims: list[dict[str, Any]]
+    information_gaps: list[str]
+
+    # Meta
+    refinement_rounds: int
+    session_id: str
+    total_duration_seconds: float
+
+    # Hybrid mode reporting
+    tool_usage: dict[str, Any]       # budget summary (calls made per tool)
+    tool_insights: list[str]         # key insights from tool calls
+    hybrid_mode: bool                # whether tool calling was active
+    model_tier: str                  # "strong" | "medium" | "weak"
 ```
 
 **Usage:**
 
 ```python
-from dopeagents.agents import ResearchAgent, ResearchInput
+from dopeagents.agents import DeepResearcher, DeepResearcherInput
 
-agent = ResearchAgent()
-output = agent.run(ResearchInput(query="Impact of LLMs on software development", depth="deep"))
-print(output.report)
+agent = DeepResearcher()
+result = agent.run(
+    DeepResearcherInput(
+        query="Impact of LLMs on software development",
+        research_focus="practical applications and productivity",
+        quality_threshold=0.8,
+        max_refinement_loops=2,
+    )
+)
+print(result.output.markdown_report)
+print(f"Confidence: {result.output.confidence:.2f}")  # grounded confidence
+print(f"LLM quality: {result.output.llm_quality_score:.2f}")
+print(f"Sources: {result.output.sources_analyzed}, Hybrid: {result.output.hybrid_mode}")
 ```
+
+**Lifecycle Cooperation (USP Integration):**
+
+DeepResearcher follows the same lifecycle-cooperation pattern as DeepSummarizer:
+
+- **Step spans:** Every step method is wrapped with `self._step_span("step_name")`. When a tracer is present in `context.metadata["tracer"]`, each step emits a child span with `span.set_attribute()` calls for step-specific data (source count, confidence, etc.). Without a tracer the steps run identically — no branching, no cost.
+- **Budget-aware refinement:** `should_refine()` consults `self._budget_config()`. If a `BudgetConfig` is present and indicates the remaining budget is exhausted, refinement is skipped even when quality is below the threshold.
+- **Per-step model overrides:** All 13 steps call `self._model_for_step("step_name")` instead of using `self._model` directly, enabling per-step model routing via `step_models`.
+- **`ExtractionProviderError` re-raise:** The `run()` method catches and re-raises `ExtractionProviderError` before a generic `except Exception` so that the lifecycle layer (retry, fallback, degradation) can react to auth/billing/quota failures.
+- **Context forwarding:** `run()` defaults `context = context or AgentContext()` and stores it on the thread-local `self._run_local.context` so helpers can access it.
 
 ### Phase 2 — Additional Agents
 
 | Agent                     | Type           | Input                       | Output                                |
 | ------------------------- | -------------- | --------------------------- | ------------------------------------- |
 | **DocumentAnalyst** | Multi-step LLM | document, questions, format | answers, evidence, confidence         |
-| **CodeReviewer**    | Multi-step LLM | code, language, focus_areas | issues, suggestions, severity_map     |
+| **CodeReviewer**    | Multi-step Hybrid | code, language, focus_areas | issues, suggestions, severity_map  |
 | **DataExtractor**   | Multi-step LLM | text, schema, strict        | extracted, confidence, missing_fields |
+
+---
+
+### 17.3 Hybrid Orchestration Methodology
+
+> This section captures the core design philosophy applied to all hybrid agents in the library.
+
+**The fundamental question every agent step must answer: who routes this?**
+
+| Decision | Belongs to | Because |
+|---|---|---|
+| Should we search at all? | Code | Always yes — no tokens wasted deciding |
+| Which search providers to hit? | Code | Always all of them — deterministic |
+| Should we fact-check this specific claim? | LLM (within budget) | Requires reading comprehension |
+| Is the quality good enough to stop? | Code (threshold) + LLM (score) | Threshold is code; scoring is judgment |
+| What search queries capture the nuance? | LLM | Context-dependent judgment |
+
+**Hybrid steps vs pure steps:**
+
+```text
+Pure code step:    search() → always runs, no LLM, deterministic, cheap
+Pure LLM step:     synthesize() → always an _extract() call, no tools, predictable cost
+Hybrid step:       deep_analysis() → _extract() to judge + optional bounded tool calls
+                   ↑ Code forces this step to run
+                             ↑ LLM decides WHAT to do inside it
+                                              ↑ Budget caps HOW MUCH
+```
+
+**Cost profile comparison:**
+
+| Architecture | Token usage | Reliability | Model requirement |
+|---|---|---|---|
+| Full tool calling (ReAct) | ~80K input tokens / query | Low (spirals, skips steps) | Requires strong model |
+| Pure coded pipeline | ~5K tokens / query | High | Any model |
+| Coded pipeline + hybrid | ~12K tokens / query | High | Degrades gracefully on weak models |
+
+**Model-agnostic degradation:**
+
+All hybrid agents use `detect_capability(model_name)` at `__init__` time. If the model doesn't support reliable tool calling (weak/unknown tier), `HybridStepRunner` disables tools and falls back to a pure `_extract()` call for that step. Same pipeline. Same steps. Different capability level. No rewrite needed.
 
 ---
 
@@ -4350,7 +4659,7 @@ dopeagents/
 │   ├── otel.py                    ●  # OTelTracer (OpenTelemetry integration)
 │   ├── instructor_hooks.py        ●  # InstructorObservabilityHooks (LLM event capture)
 │   ├── logging.py                 ●  # get_logger() (structured logging)
-│   └── debug.py                   ●  # Debug utilities
+│   └── debug.py                   ○  # Stub — DebugInfo lives in core/agent.py
 ├── cost/
 │   ├── __init__.py               ●
 │   ├── tracker.py                 ●  # CostTracker (per-agent + global, thread-safe)
@@ -4371,7 +4680,8 @@ dopeagents/
 │   ├── crewai_adapter.py          ◐  # CrewAI adapter (stub)
 │   ├── autogen_adapter.py         ◐  # AutoGen adapter (stub)
 │   ├── langgraph_adapter.py       ◐  # LangGraph adapter (stub)
-│   └── wrap.py                    ◐  # Universal wrap() helper (stub)
+│   ├── wrap.py                    ◐  # Universal wrap() helper (stub)
+│   └── simple.py                  ○  # SimpleRunner — not yet created (Phase 5 / T5.12)
 ├── mcp_server/
 │   ├── __init__.py               ●
 │   ├── server.py                  ◐  # MCP server factory (raises ImportError until fastmcp installed)
@@ -4383,11 +4693,34 @@ dopeagents/
 ├── benchmark/
 │   └── __init__.py               ○  # (planned) BenchmarkSuite + BenchmarkRunner
 ├── tools/
-│   └── __init__.py               ○  # (planned) Tool integration
+│   └── __init__.py               ○  # (planned) Tool integration — shared tools for multi-agent use
+├── agent_utils/                       #  Agent-agnostic utilities — any agent may import these
+│   ├── __init__.py               ●  # Re-exports all public symbols
+│   ├── search_providers.py        ●  # SearchEngine aggregating Wikipedia, DDG, Scholar, arXiv, CrossRef
+│   ├── content_extractor.py       ●  # ContentExtractor — async HTTP + HTML parsing
+│   ├── chunking.py                ●  # SemanticChunker + RelevanceRanker (TF-IDF BM25-style ranking)
+│   ├── credibility.py             ●  # score_credibility() — domain authority, recency, citations
+│   └── fact_checker.py            ●  # FactChecker — Wikipedia + Wikidata claim verification
+├── research/                          #  DEPRECATED — backward-compat re-export stubs only
+│   ├── __init__.py               ●  # Re-exports from agent_utils + agents/_researcher (all public symbols preserved)
+│   ├── hybrid_step.py             ●  # [redirect stub → agents/_researcher/hybrid_step]
+│   ├── model_capability.py        ●  # [redirect stub → agents/_researcher/model_capability]
+│   └── tools.py                   ●  # [redirect stub → agents/_researcher/tools]
 ├── agents/
 │   ├── __init__.py               ●
-│   ├── deep_summarizer.py         ●  # 7-step summarization agent — fully implemented (Phase 1)
-│   ├── research_agent.py          ○  # 6-step research agent — stub (Phase 1)
+│   ├── deep_summarizer.py         ●  # 7-step summarization agent — fully implemented
+│   ├── deep_researcher.py         ●  # 13-step hybrid research agent — fully implemented
+│   ├── research_agent.py          ○  # simple 6-step research agent — stub
+│   ├── _researcher/               ●  # agent-private infrastructure (DeepResearcher only)
+│   │   ├── __init__.py            ●  # re-exports all public symbols
+│   │   ├── hybrid_step.py         ●  # HybridStepRunner + HybridStepResult
+│   │   ├── tools.py               ●  # ToolBudget, ToolExecutor, ToolCall, ANALYSIS_TOOLS (5 tools)
+│   │   ├── model_capability.py    ●  # ModelCapability + detect_capability()
+│   │   ├── claim_analysis.py      ●  # Claim, ClaimCluster, CrossReferenceOutput — research workflow models
+│   │   ├── confidence.py          ●  # ConfidenceCalculator + ConfidenceBreakdown
+│   │   ├── memory.py              ●  # ResearchMemory + ResearchSession — session persistence
+│   │   ├── progress.py            ●  # ResearchProgress + StepProgress (13-step order hardcoded)
+│   │   └── report_generator.py    ●  # ReportGenerator, Citation, ReportFormat, StructuredReport
 │   └── agent_flows/
 │       └── deep_summarizer.mmd    ●  # Mermaid diagram of DeepSummarizer flow
 └── security/
@@ -4395,7 +4728,53 @@ dopeagents/
     └── redaction.py              ●  # PIIRedactor (regex patterns + field/text redaction)
 ```
 
-### 18.1 Root `__init__.py` Re-exports
+### 18.1 Separating Agent-Agnostic Utilities (`agent_utils/`) from Agent-Private Infrastructure (`agents/_<name>/`)
+
+The codebase uses a **three-tier layering** for agent support code:
+
+**Tier 1 — `agent_utils/`** (agent-agnostic, fully reusable):
+
+| Module | Role |
+|---|---|
+| `search_providers.py` | `SearchEngine` aggregating Wikipedia, DDG, Semantic Scholar, arXiv, CrossRef |
+| `content_extractor.py` | Async HTTP + HTML-to-text extraction, `ExtractedContent` |
+| `chunking.py` | `SemanticChunker` + `RelevanceRanker` — text chunking and relevance ranking |
+| `credibility.py` | `score_credibility()` — domain authority, recency, citation scoring |
+| `fact_checker.py` | `FactChecker` — Wikipedia + Wikidata claim verification |
+
+These contain no agent-specific logic and no imports from `agents/`. Any agent may import from here.
+
+**Tier 2 — `agents/_researcher/`** (DeepResearcher-specific, not a public API):
+
+| Module | Role |
+|---|---|
+| `hybrid_step.py` | `HybridStepRunner` + `HybridStepResult` — bounded tool-calling loop |
+| `tools.py` | `ToolBudget`, `ToolExecutor`, `ANALYSIS_TOOLS` — 5 research tools |
+| `model_capability.py` | `detect_capability()` — model tier detection |
+| `claim_analysis.py` | `Claim`, `ClaimCluster`, `CrossReferenceOutput` — 13-step workflow models |
+| `confidence.py` | `ConfidenceCalculator` — research-specific confidence formula |
+| `memory.py` | `ResearchMemory` + `ResearchSession` — research session persistence |
+| `progress.py` | `ResearchProgress` with hardcoded 13-step `STEP_ORDER` |
+| `report_generator.py` | `ReportGenerator`, `Citation`, `ReportFormat` — research report rendering |
+
+**Tier 3 — `research/`** (deprecated backward-compat stubs):
+
+This package was the original home for all research support code. It now contains only re-export stubs that forward to Tier 1 and Tier 2. It is preserved for backward compatibility and will be removed in a future version. **Do not add new code here.**
+
+| Pattern | Rule |
+|---|---|
+| `agent_utils/<module>.py` | Usable by any agent. No agent-specific logic. No imports from `agents/`. |
+| `agents/_researcher/<module>.py` | Private to `DeepResearcher`. Not a public API. Other agents must not import here. |
+| `agents/_<newagent>/<module>.py` | Create when a new agent needs its own private infra (tool executor, budget, runner). |
+| `research/<module>.py` | Deprecated stubs only — do not add code here. |
+
+**Convention for new hybrid agents:**
+
+When writing a new agent that needs hybrid infrastructure, create `agents/_<agentname>/` for its private files. Promote a module to `agent_utils/` only when it is genuinely reusable across at least two agents with no agent-specific coupling.
+
+---
+
+### 18.2 Root `__init__.py` Re-exports
 
 The root package re-exports the most commonly used symbols so users can write
 `from dopeagents import Agent, DeepSummarizer, ...` as shown in §23 API Reference.
@@ -4436,6 +4815,9 @@ from dopeagents.agents import (
     DeepSummarizer,
     DeepSummarizerInput,
     DeepSummarizerOutput,
+    DeepResearcher,
+    DeepResearcherInput,
+    DeepResearcherOutput,
 )
 
 __all__ = [
@@ -4454,10 +4836,11 @@ __all__ = [
     "get_logger",
     # Agents (Phase 1)
     "DeepSummarizer", "DeepSummarizerInput", "DeepSummarizerOutput",
+    "DeepResearcher", "DeepResearcherInput", "DeepResearcherOutput",
 ]
 ```
 
-> **Note:** `ResearchAgent`, `ContractChecker`, `Pipeline`, `Registry`, and `register` are not yet re-exported from the package root because their implementations are incomplete. They will be added to root imports in later phases.
+> **Note:** `ContractChecker`, `Pipeline`, `Registry`, and `register` are not yet re-exported from the package root. They are accessible from their sub-packages (`dopeagents.contracts`, `dopeagents.registry`). They will be added to root imports in a future phase.
 
 ---
 
@@ -4571,8 +4954,18 @@ import threading
 class DopeAgentsConfig(BaseSettings):
     """Reads from DOPEAGENTS_* env vars and optional .env file automatically."""
 
+    # ── Provider model defaults ──────────────────────────────────
+    groq_default_model: str = "groq/llama-3.3-70b-versatile"
+    openrouter_default_model: str = "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+    together_default_model: str = "together_ai/meta-llama/Llama-3.3-70B-Instruct-Turbo"
+
+    # ── Provider API keys (read from bare env vars, not DOPEAGENTS_ prefixed) ──
+    groq_api_key: str | None = Field(default=None, alias="GROQ_API_KEY")
+    openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
+    together_api_key: str | None = Field(default=None, alias="TOGETHER_API_KEY")
+
     # Model & API
-    default_model: str = "gpt-4o"
+    default_model: str | None = None  # None = auto-detected from active API key via resolve_model()
     api_key: Optional[str] = None
     api_base: Optional[str] = None
 
@@ -4709,27 +5102,27 @@ class PIIRedactor:
 ```text
 Status key:  ○ = not started   ◐ = scaffold only   ● = implemented & tested
 
-Phase 1: Core Thesis (ship this first)                        [◐ in progress]
+Phase 1: Core Thesis (ship this first)                        [● complete]
   ● Agent base class + _build_graph() (internal LangGraph engine)
-  ● _extract() per step (Instructor + LiteLLM)
-  ● Pipeline with typed composition checks
+  ● _extract() per step (Instructor + LiteLLM) with provider-aware retry
+  ● Pipeline with typed composition checks (ContractChecker + Pipeline)
   ● Step-level cost tracking + budget guards (on_exceeded="degrade")
   ● DeepSummarizer (7-step) — implemented, parallel chunking, plateau detection
+  ● DeepResearcher (13-step hybrid, v3.1.0) — implemented, real APIs, bounded tool calling, model-tier degradation
   ◐ MCP exposure (FastMCP ≥ 3.0) — server scaffold, requires fastmcp install
   ◐ Adapters shipped: plain Python stubs only (LangChain/CrewAI/AutoGen stubs)
-  ○ ResearchAgent (6-step)
 
-Phase 2: Production Breadth                                    [◐ in progress]
+Phase 2: Production Breadth                                    [● core complete, ○ agents pending]
   ● Observability (ConsoleTracer, OTelTracer, InstructorObservabilityHooks)
   ● PII redaction (PIIRedactor, regex-based field + pattern redaction)
   ● Resilience (RetryPolicy, FallbackChain, DegradationChain, DegradationResult)
   ● Caching layer (InMemoryCache, DiskCache with TTL + close())
   ● Error hierarchy (DopeAgentsError + 30+ typed subclasses)
-  ● Configuration system (DopeAgentsConfig via pydantic_settings)
+  ● Configuration system (DopeAgentsConfig via pydantic_settings, auto-provider detection)
   ○ Additional agents (DocumentAnalyst, CodeReviewer, DataExtractor)
   ○ Benchmark runner + evaluation suite
   ○ Agent Sandbox (runner + REPL + CLI dry-run)
-  ○ Additional framework adapters (LangChain, CrewAI, AutoGen)
+  ○ Additional framework adapters (LangChain, CrewAI, AutoGen — stubs exist)
   ○ wrap_function / wrap_class for external agents
 
 Phase 3: Ecosystem                                             [○ not started]
@@ -4770,9 +5163,9 @@ from dopeagents.errors import (
 from dopeagents.config import DopeAgentsConfig, get_config, set_config, reset_config
 from dopeagents.observability.logging import get_logger
 
-# Agents (Phase 1)
+# Agents (Phase 1 & 2)
 from dopeagents.agents import DeepSummarizer, DeepSummarizerInput, DeepSummarizerOutput
-# ResearchAgent is a planned Phase 1 agent (stub only)
+from dopeagents.agents import DeepResearcher, DeepResearcherInput, DeepResearcherOutput
 
 # Lifecycle
 from dopeagents.lifecycle import AgentExecutor, LifecycleHooks
@@ -4818,7 +5211,7 @@ from dopeagents.mcp_server import server  # FastMCP-based MCP server
 | DD-008 | Contract checker uses Pydantic types, not Agent Spec                                  | Spec is for humans/discovery. Types are for machines/composition.                                                                                                                                                                                                                                                       |
 | DD-009 | LiteLLM for model abstraction                                                         | 100+ providers, cost calculation included                                                                                                                                                                                                                                                                               |
 | DD-010 | OpenTelemetry for tracing                                                             | Industry standard, any backend                                                                                                                                                                                                                                                                                          |
-| DD-011 | Two Phase 1 agents: DeepSummarizer (7-step) + ResearchAgent (6-step)                  | Ship multi-step thesis first using production-grade agents. Single-step agents are also supported as Pattern A for simple tasks.                                                                                                                                                                                        |
+| DD-011 | Two Phase 1 agents: DeepSummarizer (7-step) + DeepResearcher (13-step hybrid)          | Ship multi-step thesis first using production-grade agents. Single-step agents are also supported as Pattern A for simple tasks.                                                                                                                                                                                        |
 | DD-012 | wrap_function/wrap_class for external agents                                          | Users bring existing code into ecosystem with minimal effort                                                                                                                                                                                                                                                            |
 | DD-013 | LangGraph is a**core** dependency; all other framework deps remain optional     | LangGraph is the internal orchestration engine inside every multi-step agent. It is hidden behind `_build_graph()` and never exposed to callers. All other integrations (LangChain, CrewAI, AutoGen) remain optional extras.                                                                                          |
 | DD-014 | Clear ImportError messages with install commands                                      | Users never see cryptic ModuleNotFoundError                                                                                                                                                                                                                                                                             |
@@ -4848,3 +5241,6 @@ from dopeagents.mcp_server import server  # FastMCP-based MCP server
 | DD-038 | `step_prompts: ClassVar[dict[str, str]]` for per-step prompt declarations           | Declaring step prompts as class-level attributes (not in `run()`) makes them inspectable without execution: `describe()` reads them, MCP Prompt primitives can surface them, and benchmarks can vary them independently. Class-level storage follows the same pattern as `system_prompt` (DD-033).                |
 | DD-039 | `on_exceeded="degrade"` returns best-result-so-far on budget exhaustion             | Multi-step agents accumulate partial results at each step. When `BudgetConfig.on_exceeded="degrade"`, the agent returns whatever was computed before the budget was hit rather than raising an exception. `DegradationResult` records which step and why, enabling callers to make informed downstream decisions.   |
 | DD-040 | `describe()` returns structured `AgentDescription`, not a formatted string        | `AgentDescription` is a Pydantic model with `name`, `steps`, `has_loops`, `model_per_step`. Callers can introspect the agent's workflow programmatically — CLI renders it as text, MCP servers expose it as a resource, and tests can assert on step count or model assignments without parsing strings.     |
+| DD-041 | Hybrid orchestration: code controls macro flow, LLM controls micro flow within bounded steps | Pure tool-calling agents require strong models, explode token costs (~4-7x), and are opaque to debug. Pure coded pipelines are deterministic but brittle. Hybrid agents get deterministic execution guarantees from code orchestration and intelligence only where judgment adds value — inside bounded hybrid steps. `ToolBudget(max_calls=N)` enforces a hard ceiling, preventing runaway loops without sacrificing LLM autonomy where it matters. |
+| DD-042 | Agent-private infrastructure lives in `agents/_<agentname>/`, not in `research/` | `research/` is a shared domain services package — reusable across agents. `HybridStepRunner`, `ToolBudget`, `ToolExecutor`, and `ANALYSIS_TOOLS` are tightly coupled to `DeepResearcher`'s hybrid architecture. Placing them in `research/` would make the shared package a dependency on one agent's design decisions. The `agents/_researcher/` pattern keeps the boundary explicit: other agents can use research domain services without inheriting the hybrid machinery. |
+| DD-043 | `detect_capability()` drives automatic tool degradation; same pipeline runs on any model tier | A hybrid agent tested on GPT-4o should not require a rewrite to run on Llama-3-8B. `ModelCapability.tier` (strong/medium/weak) determines at `__init__` time whether `HybridStepRunner` enables tools. Weak/unknown models get a plain `_extract()` call for the same step. No conditional logic in the agent — capability detection is encapsulated in `model_capability.py`. |

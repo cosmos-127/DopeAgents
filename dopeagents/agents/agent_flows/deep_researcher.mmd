@@ -1,0 +1,88 @@
+---
+config:
+  theme: dark
+  themeVariables:
+    primaryColor: "#1e1e1e"
+    primaryBorderColor: "#333333"
+    background: "#1e1e1e"
+    mainBkg: "#2d2d2d"
+    secondBkg: "#3d3d3d"
+    textColor: "#e0e0e0"
+    borderColor: "#555555"
+---
+flowchart TD
+    Start([🔍 Input: Query, Mode<br/>max_rounds, tool_budget]) --> LoadContext["<b>1. Load Context</b><br/>─────<br/>Load session from disk<br/>or create new session_id<br/>Initialize memory dicts"]
+    
+    LoadContext --> ctx_state["State:<br/>session_id, session_memory<br/>previous_findings"]
+    
+    ctx_state --> ExpandQuery["<b>2. Expand Query</b><br/>─────<br/>LLM generates 3-5<br/>sub-queries for multi-faceted<br/>search (post-truncate to 5)"]
+    
+    ExpandQuery --> exp_state["State:<br/>queries[]: original +<br/>sub-queries<br/>search_queries_list"]
+    
+    exp_state --> RealSearch["<b>3. Real Search (Async)</b><br/>─────<br/>5 providers in parallel:<br/>🌐 Wikipedia<br/>🌐 DuckDuckGo<br/>🌐 Semantic Scholar<br/>🌐 arXiv<br/>🌐 CrossRef<br/>Returns raw_results"]
+    
+    RealSearch --> search_state["State:<br/>raw_results[] (all sources)<br/>result_count,<br/>provider_coverage"]
+    
+    search_state --> ExtractContent["<b>4. Extract Content (Async)</b><br/>─────<br/>Async batch extraction<br/>Max 5 concurrent<br/>Truncate: 3K per source<br/>Track extraction_failures"]
+    
+    ExtractContent --> extract_state["State:<br/>sources_with_content[]<br/>content_extracted_count<br/>failure_rate"]
+    
+    extract_state --> ScoreCredibility["<b>5. Score Credibility</b><br/>─────<br/>Per-source scoring:<br/>• Provider reputation<br/>• Freshness/recency<br/>• Author expertise<br/>• Citation count<br/>Rank by credibility_score"]
+    
+    ScoreCredibility --> score_state["State:<br/>sources_ranked[]<br/>credibility_scores<br/>diversity_metrics"]
+    
+    score_state --> ToolCallGate{"<b>Tool Budget?</b><br/>─────<br/>Allocated: max_tools<br/>(default 5, reduced based<br/>on model tier)<br/>Current: 0/max_tools<br/>Enough budget?"}
+    
+    ToolCallGate -->|Yes| DeepAnalysis["<b>6. Deep Analysis</b><br/>─────<br/>🛠️ ONLY step with<br/>LLM tool access (5 tools):<br/>• fact_check<br/>• search_for_more<br/>• lookup_citation<br/>• get_full_text<br/>• compare_claims<br/>─────<br/>Strict budget enforcement<br/>Analyze top 3-5 sources<br/>Validate key claims"]
+    
+    ToolCallGate -->|No, Skip Tools| CrossReference["<b>7. Cross-Reference</b><br/>─────<br/>(No tool calls below)"]
+    
+    DeepAnalysis --> tool_state["State:<br/>analysis_results<br/>tool_calls_used<br/>fact_validation[]<br/>remaining_budget"]
+    
+    tool_state --> CrossReference["<b>7. Cross-Reference</b><br/>─────<br/>Detect consensus/<br/>contradictions<br/>Confidence signals:<br/>• source_diversity<br/>• credibility_agreement<br/>• claim_coverage"]
+    
+    CrossReference --> cross_state["State:<br/>consensus_map<br/>contradiction_list<br/>diversity_score<br/>agreement_ratio"]
+    
+    cross_state --> Synthesize["<b>8. Synthesize</b><br/>─────<br/>Integrate all sources<br/>Ground in actual content<br/>Quote key sources<br/>Flag ambiguities<br/>Connect to session_memory"]
+    
+    Synthesize --> syn_state["State:<br/>synthesized_research<br/>source_citations[]<br/>confidence_signals<br/>ambiguities_noted"]
+    
+    syn_state --> CalculateConfidence["<b>9. Calculate Confidence</b><br/>─────<br/>Code-based, grounded signals:<br/>confidence = f(<br/>source_diversity,<br/>credibility_agreement,<br/>claim_coverage,<br/>contradiction_count)"]
+    
+    CalculateConfidence --> conf_state["State:<br/>calculated_confidence<br/>(0.0-1.0, grounded)<br/>confidence_rationale"]
+    
+    conf_state --> LLMEvaluate["<b>10. Evaluate</b><br/>─────<br/>LLM quality scoring:<br/>• Accuracy<br/>• Completeness<br/>• Coherence<br/>Returns: llm_quality_score"]
+    
+    LLMEvaluate --> eval_state["State:<br/>llm_quality_score<br/>evaluation_feedback<br/>score_history[]"]
+    
+    eval_state --> QualityGate{"<b>Dual Quality Gate?</b><br/>─────<br/>IF calculated_confidence<br/>≥ conf_threshold<br/>AND<br/>llm_quality_score<br/>≥ quality_threshold<br/>THEN approved"}
+    
+    QualityGate -->|No, Refine| Refine["<b>11. Refine</b><br/>─────<br/>Add sources/analysis<br/>refinement_rounds++<br/>Check plateau:<br/>Δquality < 0.02?"]
+    
+    Refine --> refine_decision{"Can Refine?<br/>─────<br/>rounds < max_rounds<br/>AND<br/>NOT plateau<br/>AND budget remains"}
+    
+    refine_decision -->|Yes| RealSearch
+    refine_decision -->|No| GenerateReport["<b>12. Generate Report</b><br/>─────<br/>Format: structured/narrative<br/>Include confidence<br/>Cite all sources<br/>Note tool_calls_used<br/>List ambiguities"]
+    
+    QualityGate -->|Yes, Approved| GenerateReport
+    
+    GenerateReport --> report_state["State:<br/>final_report<br/>confidence_score<br/>source_citations<br/>tool_calls_used<br/>refinement_rounds"]
+    
+    report_state --> SaveSession["<b>13. Save Session</b><br/>─────<br/>Persist to disk:<br/>• findings<br/>• citations<br/>• confidence_data<br/>• memory_context<br/>Update session_memory"]
+    
+    SaveSession --> out_state["State:<br/>session_saved<br/>session_id"]
+    
+    out_state --> Output["📊 Output:<br/>─────<br/>research_report<br/>confidence_score<br/>source_citations<br/>tool_calls_used<br/>session_id<br/>refinement_rounds"]
+    
+    Output --> End([✅ Complete & Persisted])
+    
+    style Start fill:#2d5016,stroke:#5cb85c,color:#fff,stroke-width:2px
+    style End fill:#2d5016,stroke:#5cb85c,color:#fff,stroke-width:2px
+    style DeepAnalysis fill:#3a2020,stroke:#ff6b6b,color:#ffcccc,stroke-width:2px
+    style ToolCallGate fill:#3a3a1e,stroke:#f9a825,color:#f0e0c0,stroke-width:3px
+    style QualityGate fill:#3a3a1e,stroke:#f9a825,color:#f0e0c0,stroke-width:3px
+    style refine_decision fill:#3a3a1e,stroke:#f9a825,color:#f0e0c0,stroke-width:3px
+    style RealSearch fill:#1e3a3a,stroke:#94e2d5,color:#e0e0e0
+    style ExtractContent fill:#1e3a3a,stroke:#94e2d5,color:#e0e0e0
+    style SaveSession fill:#2d3a1a,stroke:#a6e3a1,color:#e0e0e0,stroke-width:2px
+    style Synthesize fill:#2d3a1a,stroke:#a6e3a1,color:#e0e0e0

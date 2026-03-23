@@ -132,3 +132,7 @@ ruff_cache/
 .cache
 *.db
 dopeagents.toml.local
+
+# AI research session/cache data
+.research_cache/
+.research_memory/
