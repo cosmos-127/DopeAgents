@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 import pytest
+
 from pydantic import BaseModel
 
 from dopeagents.core.agent import Agent

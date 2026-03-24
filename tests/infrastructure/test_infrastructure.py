@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import threading
 import time
+
 from typing import Any, ClassVar
 
 import pytest
+
 from pydantic import BaseModel, Field, ValidationError
 
 from dopeagents.cache.manager import InMemoryCache

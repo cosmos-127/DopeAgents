@@ -8,6 +8,7 @@ tests run against the real API. Otherwise, they use mocked LLM responses for off
 """
 
 import warnings
+
 from typing import Any
 from unittest.mock import Mock, patch
 from uuid import uuid4
@@ -564,6 +565,7 @@ class TestDeepSummarizerMaxChunksGuard:
             "word_count": 0,
             "truncated": False,
             "key_points": [],
+            "max_chunks": 10,
         }
 
         with warnings.catch_warnings(record=True) as caught:

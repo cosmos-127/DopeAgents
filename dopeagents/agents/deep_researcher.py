@@ -24,6 +24,7 @@ import json
 import threading
 import time
 import uuid
+
 from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from typing import TYPE_CHECKING, Any, ClassVar, TypedDict, cast
@@ -562,7 +563,7 @@ class DeepResearcher(Agent[DeepResearcherInput, DeepResearcherOutput]):
     @property
     def _tools_enabled(self) -> bool:
         """Whether tool calling is active for this run (per-run overrides instance default)."""
-        per_run = getattr(self._run_local, "force_tool_calling", None)
+        per_run = cast(bool | None, getattr(self._run_local, "force_tool_calling", None))
         effective = per_run if per_run is not None else self._force_tool_calling
         if effective is not None:
             return effective

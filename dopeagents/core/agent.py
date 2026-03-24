@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import warnings
+
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, ClassVar, Generic, TypeVar, cast, get_args, get_origin
@@ -321,8 +322,9 @@ class Agent(ABC, Generic[InputT, OutputT]):
 
                 # Rate limit — exponential backoff with fast-fail for long waits.
                 if isinstance(
-                    actual_exc, (_litellm.RateLimitError | _litellm.RouterRateLimitError)
-                ):  # type: ignore[attr-defined]
+                    actual_exc,
+                    (_litellm.RateLimitError | _litellm.RouterRateLimitError),  # type: ignore[attr-defined]
+                ):
                     retry_after: int | None = None
                     m = re.search(r"try again in (\d+)m([\d.]+)s", str(actual_exc))
                     if m:

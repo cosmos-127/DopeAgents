@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+
 from collections.abc import Callable as CallableType
 from typing import Any, get_args, get_origin
 

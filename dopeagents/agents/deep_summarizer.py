@@ -14,6 +14,7 @@ and evaluation-driven iterative refinement:
 from __future__ import annotations
 
 import threading
+
 from collections.abc import Generator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypedDict, cast
@@ -66,6 +67,7 @@ class DeepSummarizerState(TypedDict):
     word_count: int
     truncated: bool
     key_points: list[str]
+    max_chunks: int
 
 
 # ── Public Input / Output ──────────────────────────────────────────────────────
@@ -347,9 +349,23 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
 
         No LLM call. Delegates to :class:`~dopeagents.agents._summarizer.chunker.SummarizerChunker`.
         """
+        import warnings
+
         with self._step_span("chunk") as span:
             target_size = state["analysis"].get("recommended_chunk_size", 512)
             chunks = SummarizerChunker().chunk(state["text"], target_size)
+
+            # Apply max_chunks guard
+            max_chunks = state.get("max_chunks", 25)
+            if len(chunks) > max_chunks:
+                warnings.warn(
+                    f"Chunks list ({len(chunks)}) exceeds max_chunks limit ({max_chunks}). "
+                    f"Truncating to {max_chunks} chunks.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                chunks = chunks[:max_chunks]
+
             if span:
                 span.set_attribute("chunk_count", len(chunks))
                 span.set_attribute("target_size", target_size)
@@ -654,6 +670,7 @@ class DeepSummarizer(Agent[DeepSummarizerInput, DeepSummarizerOutput]):
             "word_count": 0,
             "truncated": False,
             "key_points": [],
+            "max_chunks": 25,
         }
 
         try:

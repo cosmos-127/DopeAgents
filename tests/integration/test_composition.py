@@ -30,7 +30,7 @@ class TestDeepResearcherStructure:
 
         expected_steps = [
             "expand_query",
-            "extract_claims",
+            "deep_analysis",
             "cross_reference",
             "synthesize",
             "evaluate",

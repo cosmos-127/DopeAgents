@@ -6,6 +6,7 @@ Checks if upstream APIs are working and collects diagnostics.
 
 import asyncio
 import time
+
 from datetime import datetime
 
 from dopeagents.agent_utils.search_providers import (

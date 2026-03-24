@@ -3,6 +3,7 @@
 from typing import Any
 
 import pytest
+
 from pydantic import BaseModel
 
 from dopeagents.contracts.pipeline import Pipeline

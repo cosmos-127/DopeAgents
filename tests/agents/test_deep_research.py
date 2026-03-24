@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -180,13 +181,17 @@ class TestSearchEngine:
 
         provider_a = MagicMock()
         provider_a.content_type = "web"
+        provider_a.name = "provider_a"
         provider_a.search = AsyncMock(return_value=[result_1])
 
         provider_b = MagicMock()
         provider_b.content_type = "web"
+        provider_b.name = "provider_b"
         provider_b.search = AsyncMock(return_value=[result_2, result_dup])
 
-        engine = SearchEngine(providers=[provider_a, provider_b])
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = None
+        engine = SearchEngine(providers=[provider_a, provider_b], cache=mock_cache)
         results = await engine.search("test query")
 
         assert len(results) == 2
@@ -197,10 +202,12 @@ class TestSearchEngine:
     async def test_filters_by_content_type(self) -> None:
         provider_web = MagicMock()
         provider_web.content_type = "web"
+        provider_web.name = "web"
         provider_web.search = AsyncMock(return_value=[])
 
         provider_academic = MagicMock()
         provider_academic.content_type = "academic"
+        provider_academic.name = "academic"
         provider_academic.search = AsyncMock(
             return_value=[
                 SearchResult(
@@ -212,7 +219,9 @@ class TestSearchEngine:
             ]
         )
 
-        engine = SearchEngine(providers=[provider_web, provider_academic])
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = None
+        engine = SearchEngine(providers=[provider_web, provider_academic], cache=mock_cache)
         results = await engine.search("test", content_types=["academic"])
 
         # Only academic provider should be searched
@@ -223,6 +232,7 @@ class TestSearchEngine:
     async def test_handles_provider_failure(self) -> None:
         provider_ok = MagicMock()
         provider_ok.content_type = "web"
+        provider_ok.name = "ok"
         provider_ok.search = AsyncMock(
             return_value=[
                 SearchResult(
@@ -239,7 +249,9 @@ class TestSearchEngine:
         provider_bad.name = "bad_provider"
         provider_bad.search = AsyncMock(side_effect=Exception("API down"))
 
-        engine = SearchEngine(providers=[provider_ok, provider_bad])
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = None
+        engine = SearchEngine(providers=[provider_ok, provider_bad], cache=mock_cache)
         results = await engine.search("test")
 
         assert len(results) == 1
@@ -275,7 +287,9 @@ class TestSearchEngine:
             )
         )
 
-        engine = SearchEngine(providers=[provider_ok, provider_bad])
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = None
+        engine = SearchEngine(providers=[provider_ok, provider_bad], cache=mock_cache)
 
         first_results = await engine.search("test")
         second_results = await engine.search("test")

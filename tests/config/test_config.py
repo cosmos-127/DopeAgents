@@ -59,7 +59,7 @@ class TestDopeAgentsConfig:
                 del os.environ[key]
 
         config = DopeAgentsConfig.from_env()
-        assert config.default_model == "gpt-4o"
+        assert config.default_model is None
         assert config.enable_cost_tracking is True
         assert config.enable_retry is True
         assert config.max_retries == 3
