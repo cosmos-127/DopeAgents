@@ -37,6 +37,8 @@ Requires **Python 3.12+**.
 
 ## Quick start
 
+### DeepSummarizer
+
 ```python
 from dopeagents import DeepSummarizer
 from dopeagents.agents import DeepSummarizerInput
@@ -56,7 +58,57 @@ result = summarizer.run(
 if result.success:
     print(result.output.summary)
     print(f"Quality: {result.output.quality_score:.2f}")
-    print(f"Cost:    ${result.metrics.total_cost:.4f}")
+    print(f"Cost:    ${result.metrics.cost_usd:.4f}")
+```
+
+### DeepResearcher
+
+```python
+from dopeagents.agents import DeepResearcher, DeepResearcherInput
+from dopeagents.agents._researcher.report_generator import ReportFormat
+from dopeagents.lifecycle.executor import AgentExecutor
+from dopeagents.cost.guard import BudgetConfig
+from dopeagents.observability.tracer import ConsoleTracer
+from dopeagents.resilience.retry import RetryPolicy
+
+researcher = DeepResearcher(memory_dir=".research_memory")
+
+executor = AgentExecutor(
+    tracer=ConsoleTracer(),
+    budget=BudgetConfig(
+        max_cost_per_call=1.50,
+        max_refinement_loops=3,
+        on_exceeded="error",
+    ),
+)
+
+result = executor.run(
+    agent=researcher,
+    input=DeepResearcherInput(
+        query="What are the latest advancements in quantum computing hardware?",
+        research_focus="comprehensive",
+        report_format=ReportFormat.MARKDOWN,
+        enable_tool_calling=None,  # auto-detect from model capability
+        tool_budget=5,
+        quality_threshold=0.80,
+        max_refinement_loops=2,
+        enable_memory=True,
+    ),
+    retry_policy=RetryPolicy(
+        max_attempts=3,
+        delay_seconds=2.0,
+        backoff_factor=2.0,
+        retryable_errors=[TimeoutError, ConnectionError],
+    ),
+)
+
+if result.success:
+    out = result.output
+    print(out.synthesis)
+    print(f"Confidence:   {out.confidence:.2f}")
+    print(f"Sources:      {out.sources_analyzed}")
+    print(f"Key findings: {len(out.key_findings)}")
+    print(f"Cost:         ${result.metrics.cost_usd:.4f}")
 ```
 
 ---
@@ -109,10 +161,10 @@ Thirteen steps, hybrid code + bounded LLM tool calling:
 9. Calculate grounded confidence score (code)
 10. Evaluate report quality, detect gaps (LLM)
 11. Gap-fill with targeted searches (LLM + code)
-12. Generate structured report — markdown, JSON, or plain text (LLM + code)
+12. Generate structured report — markdown, JSON, executive summary, or academic (LLM + code)
 13. Persist session for follow-up queries (code)
 
-> **Status:** fully implemented and tested; not yet exported from the top-level `dopeagents` namespace. Import from `dopeagents.agents.deep_researcher`.
+Import from `dopeagents.agents`. `ReportFormat` is available via `dopeagents.agents._researcher.report_generator`.
 
 ---
 
